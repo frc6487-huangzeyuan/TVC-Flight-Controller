@@ -1,0 +1,5 @@
+/*
+  Permissions-Policy: serial=(self)
+  X-Content-Type-Options: nosniff
+/*.mjs
+  Content-Type: text/javascript; charset=utf-8

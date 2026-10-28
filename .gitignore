@@ -1,0 +1,5 @@
+/NetworkSecrets.h
+*.log
+build/
+.DS_Store
+Thumbs.db
