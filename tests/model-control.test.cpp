@@ -20,6 +20,17 @@ int main(){
   float a=(az-180)*.0174532925199433f;
   assert(std::fabs((el-135)*std::cos(a)+2)<.15f);
   assert(std::fabs((el-135)*std::sin(a)-1)<.15f);
+  // 初始方位在边缘时，模型模式选择中间半圈的等价解。
+  int edge[2]={500,1500};assert(prepare.begin(c,3,4,edge));
+  az=GimbalPid::usToAngle(prepare.goal(0),0);
+  assert(az>=90&&az<=270);
+  float desiredX,desiredY;GimbalPid::initialVector(c,3,4,desiredX,desiredY);
+  el=GimbalPid::usToAngle(prepare.goal(1),1);a=(az-180)*.0174532925199433f;
+  assert(std::fabs((el-135)*std::cos(a)-desiredX)<.15f);
+  assert(std::fabs((el-135)*std::sin(a)-desiredY)<.15f);
+  assert(near(GimbalPid::initialAzimuthReference(c,0,-2,1),180));
+  assert(near(GimbalPid::initialAzimuthReference(c,0,0,0),0));
+  c.model.enabled=false;assert(near(GimbalPid::initialAzimuthReference(c,0,-2,1),0));c.model.enabled=true;
   GimbalPid pid(c);int target[2]={1500,1500};
   for(int i=0;i<600;++i){
     auto result=pid.update(1000000+10000*i,i<300?20:-20,5,sent,target);

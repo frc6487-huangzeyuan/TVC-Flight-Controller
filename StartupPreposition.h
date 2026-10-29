@@ -9,7 +9,8 @@ class StartupPreposition {
     float vx,vy;GimbalPid::initialVector(c,leanX,leanY,vx,vy);
     if(!std::isfinite(vx)||!std::isfinite(vy))return false;
     float azimuth,elevation;
-    GimbalPid::vectorToAngles(vx,vy,GimbalPid::usToAngle(sent[0],0),c.azimuthZero,azimuth,elevation);
+    const float current=GimbalPid::usToAngle(sent[0],0);
+    GimbalPid::vectorToAngles(vx,vy,GimbalPid::initialAzimuthReference(c,current,vx,vy),c.azimuthZero,azimuth,elevation);
     goal_[0]=limitServoUs(0,GimbalPid::angleToUs(azimuth,0));
     goal_[1]=limitServoUs(1,GimbalPid::angleToUs(elevation,1));
     lean_[0]=leanX;lean_[1]=leanY;atGoal_=false;active_=true;return true;

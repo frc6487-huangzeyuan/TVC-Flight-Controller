@@ -99,6 +99,12 @@ class GimbalPid {
   static float controlLimit(const GimbalConfig &c) {
     return c.model.enabled ? c.model.accelerationLimit : c.limit;
   }
+  // 推力关闭且台架固定的启动准备阶段，模型模式优先选择远离方位行程两端
+  // 的等价解，减少释放后接近 0°/360° 时需要跨越半圈的换向。
+  // 普通 PID 保留原有最近当前位置规则；运行阶段仍按当前指令选解。
+  static float initialAzimuthReference(const GimbalConfig &c,float currentAzimuth,float vx,float vy) {
+    return c.model.enabled && std::hypot(vx,vy)>=.15f ? 180.0f : currentAzimuth;
+  }
   // 模型模式先把期望角加速度换算成纠偏向量，再由同一逆运动学解算舵角。
   static void correctionVector(const GimbalConfig &c,float leanX,float leanY,
                                float ux,float uy,float &vx,float &vy) {
