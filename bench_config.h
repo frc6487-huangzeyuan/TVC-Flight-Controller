@@ -72,6 +72,15 @@ constexpr float AUTO_ROLL_KD = 0.03f;
 constexpr float AUTO_MAX_CORRECTION_DEG = 15.0f;
 constexpr float AUTO_INTEGRAL_LIMIT_DEG = 3.0f;
 constexpr float AUTO_D_FILTER_SECONDS = 0.03f;
+// 模型控制必须使用本台架的实测参数；默认关闭。矩阵按行排列，
+// q¨ = A*q + B*(v-bias)，q 为机体倾角，v 为二维推力纠偏角。
+// 标定完成后填入 bias、A、B 的逆矩阵，并重新整定角加速度 PID。
+// 全零矩阵不能作为实物标定；误启用时主控将拒绝无效配置。
+constexpr bool AUTO_MODEL_ENABLED = false;
+constexpr float AUTO_MODEL_BIAS[2] = {0,0};
+constexpr float AUTO_MODEL_GRAVITY[4] = {0,0,0,0};
+constexpr float AUTO_MODEL_INVERSE[4] = {0,0,0,0};
+constexpr float AUTO_MODEL_ACCEL_LIMIT = 15.0f; // 角加速度上限，度/秒²。
 constexpr int SERVO_SLEW_US_PER_TICK = 3;   // 每 10 ms 最多变化 3us，即 300us/s；同时限制自动与手动指令速度。
 // 预定位到达目标 PWM 后额外等待；这是估计时间，不是舵机位置反馈。
 constexpr uint32_t PREPOSITION_SETTLE_MS = 2000;

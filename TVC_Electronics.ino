@@ -90,13 +90,19 @@ uint32_t calibrationAt = 0, armAt = 0;
 int servoTarget[2] = {1500, 1500}, servoActual[2] = {1500, 1500};
 int escStop = 0, escMin = 0, escMax = 0, escTarget = 0, escActual = 0;
 float autoZeroRoll = 0, autoZeroPitch = 0, autoErrorRoll = 0, autoErrorPitch = 0;
-GimbalPid automaticPid({
-  {AUTO_PITCH_KP,AUTO_PITCH_KI,AUTO_PITCH_KD},
-  {AUTO_ROLL_KP,AUTO_ROLL_KI,AUTO_ROLL_KD},
-  AUTO_MAX_CORRECTION_DEG,AUTO_INTEGRAL_LIMIT_DEG,AUTO_D_FILTER_SECONDS,
-  GIMBAL_AZIMUTH_ZERO_DEG,GIMBAL_VECTOR_X_SIGN,GIMBAL_VECTOR_Y_SIGN,
-  SERVO_SLEW_US_PER_TICK,PID_MAX_TICK_GAP_US
-});
+GimbalConfig initialGimbalConfig() {
+  GimbalConfig c{{AUTO_PITCH_KP,AUTO_PITCH_KI,AUTO_PITCH_KD},
+    {AUTO_ROLL_KP,AUTO_ROLL_KI,AUTO_ROLL_KD},
+    AUTO_MAX_CORRECTION_DEG,AUTO_INTEGRAL_LIMIT_DEG,AUTO_D_FILTER_SECONDS,
+    GIMBAL_AZIMUTH_ZERO_DEG,GIMBAL_VECTOR_X_SIGN,GIMBAL_VECTOR_Y_SIGN,
+    SERVO_SLEW_US_PER_TICK,PID_MAX_TICK_GAP_US};
+  c.model.enabled=AUTO_MODEL_ENABLED;
+  for(int i=0;i<2;++i)c.model.bias[i]=AUTO_MODEL_BIAS[i];
+  for(int i=0;i<4;++i){c.model.gravity[i]=AUTO_MODEL_GRAVITY[i];c.model.inverse[i]=AUTO_MODEL_INVERSE[i];}
+  c.model.accelerationLimit=AUTO_MODEL_ACCEL_LIMIT;
+  return c;
+}
+GimbalPid automaticPid(initialGimbalConfig());
 uint32_t armHold = 3000, configRevision = 0, badFrames = 0;
 
 uint32_t crc32(const uint8_t *data, size_t length) {
@@ -684,6 +690,7 @@ void telemetry() {
   throttle["base_pct"]=tiltThrottle.config.base;throttle["gain_pct_deg"]=tiltThrottle.config.gain;throttle["max_pct"]=tiltThrottle.config.maximum;throttle["deadband_deg"]=tiltThrottle.config.deadband;throttle["ramp_pct_s"]=tiltThrottle.config.ramp;
   auto angles=outputs.createNestedArray("servo_deg");for(int k=0;k<2;++k)angles.add(GimbalPid::usToAngle(servoActual[k],k));
   const auto &cfg=automaticPid.config();
+  control["model_enabled"]=cfg.model.enabled;
   control["azimuth_zero_deg"]=cfg.azimuthZero;control["sign_x"]=cfg.signX;control["sign_y"]=cfg.signY;
   auto mount=control.createNestedArray("mount_matrix");for(int r=0;r<3;++r)for(int c=0;c<3;++c)mount.add(mountingMatrix[r][c]);
   auto pid=control.createNestedObject("pid");pid["dt_s"]=automaticPid.dt();
