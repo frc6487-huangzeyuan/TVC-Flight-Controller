@@ -6,10 +6,8 @@ class StartupPreposition {
  public:
   bool begin(const GimbalConfig &c, float leanX, float leanY, const int sent[2]) {
     if (!GimbalPid(c).configurationValid() || !std::isfinite(leanX) || !std::isfinite(leanY)) return false;
-    float vx=c.signX*std::max(-c.limit,std::min(c.limit,-c.x.kp*leanX));
-    float vy=c.signY*std::max(-c.limit,std::min(c.limit,-c.y.kp*leanY));
-    const float magnitude=std::hypot(vx,vy);
-    if(magnitude>c.limit){vx*=c.limit/magnitude;vy*=c.limit/magnitude;}
+    float vx,vy;GimbalPid::initialVector(c,leanX,leanY,vx,vy);
+    if(!std::isfinite(vx)||!std::isfinite(vy))return false;
     float azimuth,elevation;
     GimbalPid::vectorToAngles(vx,vy,GimbalPid::usToAngle(sent[0],0),c.azimuthZero,azimuth,elevation);
     goal_[0]=limitServoUs(0,GimbalPid::angleToUs(azimuth,0));

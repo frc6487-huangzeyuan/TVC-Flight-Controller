@@ -44,12 +44,29 @@ inline bool gimbalLean(const AttitudeMatrix &r, float &x, float &y) {
   return true;
 }
 
+// 可选的已标定小角度动力学：q¨ = A q + B (v - bias)。
+// q 为机体倾角（度），v 为二维纠偏角（度）；时间单位为秒。
+// 未提供标定时保持普通 PID。不得把仿真 CAD 参数当成实物标定。
+#define TVC_MODEL_COMPENSATION_API 1
+struct GimbalModel {
+  bool enabled=false;
+  float bias[2]={0,0}, gravity[4]={0,0,0,0}, inverse[4]={0,0,0,0};
+  float accelerationLimit=15; // 模型模式下 PID 输出的角加速度上限，度/秒²。
+  bool valid() const {
+    if(!enabled)return true;
+    for(int i=0;i<2;++i)if(!std::isfinite(bias[i]))return false;
+    for(int i=0;i<4;++i)if(!std::isfinite(gravity[i])||!std::isfinite(inverse[i]))return false;
+    return std::isfinite(accelerationLimit) && accelerationLimit>0 &&
+      std::fabs(inverse[0]*inverse[3]-inverse[1]*inverse[2])>1e-9f;
+  }
+};
 struct GimbalConfig {
   PidGains x,y;
   float limit,integralLimit,derivativeSeconds;
   float azimuthZero,signX,signY;
   int stepUs;
   uint32_t maxGapUs;
+  GimbalModel model{};
 };
 
 // 方位位置舵机 0..360°；俯仰位置舵机 0..270°、135°为无偏转。
@@ -58,10 +75,10 @@ class GimbalPid {
  public:
   enum Result { WAITING,UPDATED,INVALID };
   explicit GimbalPid(const GimbalConfig &c)
-      : config_(c),x_(c.x,c.limit,c.integralLimit,c.derivativeSeconds),
-        y_(c.y,c.limit,c.integralLimit,c.derivativeSeconds) { reset(); }
+      : config_(c),x_(c.x,controlLimit(c),c.integralLimit,c.derivativeSeconds),
+        y_(c.y,controlLimit(c),c.integralLimit,c.derivativeSeconds) { reset(); }
   bool configurationValid() const {
-    return x_.configurationValid() && y_.configurationValid() &&
+    return config_.model.valid() && x_.configurationValid() && y_.configurationValid() &&
       config_.limit>=1 && config_.limit<=50 && std::isfinite(config_.azimuthZero) &&
       config_.azimuthZero>=0 && config_.azimuthZero<=360 &&
       (config_.signX==1 || config_.signX==-1) && (config_.signY==1 || config_.signY==-1) &&
@@ -78,6 +95,27 @@ class GimbalPid {
   }
   static float usToAngle(int us,int channel) {
     return (us-500)*(channel==0?360.0f:270.0f)/2000;
+  }
+  static float controlLimit(const GimbalConfig &c) {
+    return c.model.enabled ? c.model.accelerationLimit : c.limit;
+  }
+  // 模型模式先把期望角加速度换算成纠偏向量，再由同一逆运动学解算舵角。
+  static void correctionVector(const GimbalConfig &c,float leanX,float leanY,
+                               float ux,float uy,float &vx,float &vy) {
+    if(c.model.enabled) {
+      const auto &m=c.model;
+      const float ax=ux-m.gravity[0]*leanX-m.gravity[1]*leanY;
+      const float ay=uy-m.gravity[2]*leanX-m.gravity[3]*leanY;
+      vx=m.bias[0]+m.inverse[0]*ax+m.inverse[1]*ay;
+      vy=m.bias[1]+m.inverse[2]*ax+m.inverse[3]*ay;
+    } else { vx=c.signX*ux;vy=c.signY*uy; }
+  }
+  static void initialVector(const GimbalConfig &c,float x,float y,float &vx,float &vy) {
+    const float limit=controlLimit(c);
+    correctionVector(c,x,y,std::max(-limit,std::min(limit,-c.x.kp*x)),
+                     std::max(-limit,std::min(limit,-c.y.kp*y)),vx,vy);
+    const float magnitude=std::hypot(vx,vy);
+    if(magnitude>c.limit){vx*=c.limit/magnitude;vy*=c.limit/magnitude;}
   }
   // 低偏转时保持方位；同一向量存在“方位+180°、俯仰取反”的等价解，
   // 按有限行程的实际指令距离选解，避免在 0/360°处跳到另一端。
@@ -108,9 +146,12 @@ class GimbalPid {
     uint64_t elapsed=sampleUs-sampleUs_;
     if(elapsed<100 || elapsed>config_.maxGapUs) return INVALID;
     dt_=float(elapsed)/1e6f;
-    if(!x_.update(0,leanX,dt_,-config_.limit,config_.limit,!limited_&&allowIntegral) ||
-       !y_.update(0,leanY,dt_,-config_.limit,config_.limit,!limited_&&allowIntegral)) return INVALID;
-    float vx=config_.signX*x_.terms().output,vy=config_.signY*y_.terms().output;
+    const float control=controlLimit(config_);
+    if(!x_.update(0,leanX,dt_,-control,control,!limited_&&allowIntegral) ||
+       !y_.update(0,leanY,dt_,-control,control,!limited_&&allowIntegral)) return INVALID;
+    float vx,vy;
+    correctionVector(config_,leanX,leanY,x_.terms().output,y_.terms().output,vx,vy);
+    if(!std::isfinite(vx)||!std::isfinite(vy))return INVALID;
     float magnitude=std::hypot(vx,vy);
     bool saturated=magnitude>config_.limit;
     if(saturated) { vx*=config_.limit/magnitude;vy*=config_.limit/magnitude; }
