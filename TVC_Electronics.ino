@@ -1,6 +1,6 @@
 // TVC 实验平台：两路 MPU6050 都可以作为 PID 控制源，由网页明确切换。
-//   IMU1：采集板 ESP32-S3 SuperMini 读取 0x68，经 UART1 发给原主控。
-//   IMU2：直接接原主控 SDA9/SCL10，AD0=3.3V，地址 0x69，INT=GPIO8。
+//   本 PCB 两块 MPU6050 共用主控 SDA9/SCL10。
+//   IMU1：AD0=GND，地址 0x68，INT=GPIO8；IMU2：AD0=3.3V，地址 0x69，INT=GPIO2。
 // 未被选中的那一路继续采样，只作为校验数据，不参与姿态估计和 PID。
 // 在 Arduino IDE 中打开本文件，MotorControl.ino 和 bench_config.h 必须放在同一目录。
 // 构建依赖：Espressif ESP32 开发板包 3.3.12、ArduinoJson 7.4.3、WebSockets 2.7.2。
@@ -12,6 +12,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include <HardwareSerial.h>
 #include "PrimaryUartProtocol.h"
 #include <esp_timer.h>
@@ -24,6 +25,8 @@
 #include "AutoLevelPid.h"
 #include "GimbalControl.h"
 #include "StartupPreposition.h"
+#include "ThrustTorqueControl.h"
+#include "ServoCalibration.h"
 #include "HistoryAttitude.h"
 #include "TiltThrottle.h"
 #include "ImuState.h"
@@ -35,16 +38,21 @@
 #error "Use esp32 by Espressif Systems 2.x or 3.x."
 #endif
 
-// 在 MotorControl.ino 标签页中实现，通道 0/1 对应舵机，通道 2 对应电调。
+// 在 MotorControl.ino 标签页中实现，通道 0/1 对应云台，2 对应电调，3 对应重心舵机。
+int servoOutputUs(int channel, int commandUs);
 void pulse(int channel, int us);
 void disablePulse(int channel);
 void beginImu2Monitor();
 void sampleImu2Monitor();
+void beginImu1Monitor();
+void sampleImu1Monitor();
 void appendImu2Telemetry(JsonObject item, uint64_t now);
 void beginPrimaryUart();
 void printPrimaryDebug();
 bool pollPrimaryUart(PrimaryUart::Sample &sample);
 extern Imu2MonitorState imu2Monitor;
+extern Imu2MonitorState imu1Monitor;
+extern volatile uint32_t imu1IrqCount, imu2IrqCount;
 
 Imu primaryImu(IMU_ADDRESS); // IMU1 的独立采集缓存，未选中时仅作为校验数据
 uint8_t controlSource=DEFAULT_CONTROL_SOURCE;
@@ -52,6 +60,7 @@ Imu imu(DEFAULT_CONTROL_SOURCE==1?IMU_ADDRESS:IMU2_ADDRESS); // 当前选中源�
 // IMU2 通道已被控制逻辑消费到的样本计数，与 imu2Consumed（I2C 读取计数）分开。
 // 切换控制源时把它对齐到最新计数，避免把切换前缓存的老样本当成新测量。
 uint32_t imu2ControlConsumed=0;
+uint32_t imu1ControlConsumed=0;
 Attitude attitude;
 Attitude controlAttitude;
 uint64_t lastControlMeasurementUs=0;
@@ -69,7 +78,9 @@ SemaphoreHandle_t stateLock;
 portMUX_TYPE irqLock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t primaryReplies=0,primaryBadFrames=0,primaryRejected=0,primaryTimeouts=0;
 uint32_t primaryRemoteBoot=0;
-bool initialControlCalibrationPending=true;
+bool savedGravityReference=false;
+uint8_t gravityStartupSamples=0;
+float gravityStartupFirst[3]={},gravityStartupSum[3]={};
 char bootId[17], sessionId[33] = "";
 const char *fault = "";
 bool heartbeatWarning=false; // 心跳超时只告警，不属于会停止执行器的 fault。
@@ -77,6 +88,8 @@ uint32_t lastCommandSeq = 0, txSeq = 0, heartbeatAt = 0, controllerSeenAt = 0, e
 bool servoEnabled = false, escConfigured = false, escArmed = false, escArming = false, autoEnabled = false;
 bool escSignalEnabled = false;
 StartupPreposition startupPreposition;
+ThrustTorqueControl thrustTorque;
+bool torquePrepared=false,torqueActive=false;
 bool prepositionOwnedServos=false,prepositionResumeAuto=false;
 uint32_t prepositionAt=0;
 bool actuatorPwmFault = false;
@@ -87,7 +100,12 @@ bool calibrated = false, calibrating = false;
 enum OperatingMode : uint8_t { MODE_ATTITUDE, MODE_MANUAL };
 OperatingMode operatingMode = MODE_ATTITUDE;
 uint32_t calibrationAt = 0, armAt = 0;
-int servoTarget[2] = {1500, 1500}, servoActual[2] = {1500, 1500};
+const int defaultAzimuthCenterUs=GimbalPid::angleToUs(GIMBAL_AZIMUTH_ZERO_DEG,0);
+int servoTarget[2] = {defaultAzimuthCenterUs, SERVO_CENTER_US};
+int servoActual[2] = {defaultAzimuthCenterUs, SERVO_CENTER_US};
+bool cgServoEnabled = false;
+int cgServoUs = CG_SERVO_INITIAL_US, cgServoDirection = 0;
+uint32_t cgServoJogAt = 0;
 int escStop = 0, escMin = 0, escMax = 0, escTarget = 0, escActual = 0;
 float autoZeroRoll = 0, autoZeroPitch = 0, autoErrorRoll = 0, autoErrorPitch = 0;
 GimbalConfig initialGimbalConfig() {
@@ -104,6 +122,50 @@ GimbalConfig initialGimbalConfig() {
 }
 GimbalPid automaticPid(initialGimbalConfig());
 uint32_t armHold = 3000, configRevision = 0, badFrames = 0;
+ServoCalibration servoCalibration{DEFAULT_AZIMUTH_SERVO_CENTER_TENTHS,DEFAULT_ELEVATION_SERVO_CENTER_DEG,0,ELEVATION_SERVO_REVERSED};
+int servoCenterUs[2]={SERVO_CENTER_US,SERVO_CENTER_US};
+
+void applyServoCalibration(const ServoCalibration &calibration) {
+  servoCalibration=calibration;
+  servoCenterUs[0]=GimbalPid::angleToUs(calibration.azimuthTenths/10.0f,0);
+  servoCenterUs[1]=constrain(GimbalPid::angleToUs(calibration.elevationDeg,1),ELEVATION_PHYSICAL_MIN_US,ELEVATION_PHYSICAL_MAX_US);
+  GimbalConfig config=automaticPid.config();
+  config.azimuthZero=GIMBAL_AZIMUTH_ZERO_DEG;
+  automaticPid=GimbalPid(config);
+  servoActual[0]=servoTarget[0]=GimbalPid::angleToUs(config.azimuthZero,0);
+  servoActual[1]=servoTarget[1]=SERVO_CENTER_US;
+}
+
+void loadServoCalibration() {
+  Preferences storage;
+  ServoCalibration calibration=servoCalibration;
+  ServoCalibration saved{};
+  if(storage.begin("tvc-servo",true)){
+    if(storage.getBytesLength("cal-v6")==sizeof(saved)&&
+       storage.getBytes("cal-v6",&saved,sizeof(saved))==sizeof(saved)&&saved.valid()){
+      calibration=saved;
+    } else {
+      const char *oldKey=storage.getBytesLength("cal-v5")==sizeof(saved)?"cal-v5":storage.getBytesLength("cal-v4")==sizeof(saved)?"cal-v4":storage.getBytesLength("cal-v3")==sizeof(saved)?"cal-v3":storage.getBytesLength("cal-v2")==sizeof(saved)?"cal-v2":"cal-v1";
+      if(storage.getBytesLength(oldKey)==sizeof(saved)&&
+         storage.getBytes(oldKey,&saved,sizeof(saved))==sizeof(saved)&&saved.valid()){
+        // 升级使用 186.8° 方位中位，保留俯仰中位和两轴方向。
+        calibration.elevationDeg=saved.elevationDeg;
+        calibration.azimuthReversed=saved.azimuthReversed;
+        calibration.elevationReversed=saved.elevationReversed;
+      }
+    }
+    storage.end();
+  }
+  applyServoCalibration(calibration);
+}
+
+bool saveServoCalibration(const ServoCalibration &calibration) {
+  Preferences storage;
+  if(!storage.begin("tvc-servo",false))return false;
+  const bool saved=storage.putBytes("cal-v6",&calibration,sizeof(calibration))==sizeof(calibration);
+  storage.end();
+  return saved;
+}
 
 uint32_t crc32(const uint8_t *data, size_t length) {
   uint32_t c = 0xffffffff;
@@ -114,16 +176,32 @@ uint32_t crc32(const uint8_t *data, size_t length) {
   return c ^ 0xffffffff;
 }
 
+// 调用者已持有 stateLock。方位启用位置与当前云台解算的零位一致。
+void enableServosAtCenter() {
+  servoEnabled=true;
+  servoActual[0]=servoTarget[0]=GimbalPid::angleToUs(automaticPid.config().azimuthZero,0);
+  servoActual[1]=servoTarget[1]=SERVO_CENTER_US;
+  pulse(0,servoActual[0]);
+  pulse(1,servoActual[1]);
+}
+
 // 调用者已持有 stateLock；当前电子平台测试方案会关闭舵机 PWM 输出。
 // 安装实物机构后，可能需要根据测试结果选择不同的保持位置或回中策略。
 void stopEscOutput();
 void stopServoOutput() {
-  if(tiltThrottleEnabled)stopEscOutput(); // 联动油门不能在姿态回中已停止时继续运行。
+  if(tiltThrottleEnabled||torquePrepared)stopEscOutput();
   autoEnabled = false; servoEnabled = false;
   automaticPid.reset();
   disablePulse(0); disablePulse(1);
 }
 void stopEscOutput() {
+  if(torquePrepared){
+    autoEnabled=false;servoEnabled=false;
+    disablePulse(0);disablePulse(1);
+    prepositionOwnedServos=prepositionResumeAuto=false;
+  }
+  torquePrepared=torqueActive=false;
+  thrustTorque.reset();
   tiltThrottleEnabled=false;tiltThrottle.reset();
   if(startupPreposition.active()){
     startupPreposition.cancel();
@@ -135,7 +213,12 @@ void stopEscOutput() {
   if (escConfigured && escSignalEnabled) { escActual = escTarget = escStop; pulse(2, escStop); }
   else { escActual = escTarget = 0; disablePulse(2); }
 }
-void stopOutputs() { ++epoch; autoMotorAllowed=false; stopServoOutput(); stopEscOutput(); }
+void stopCgServoOutput() {
+  cgServoEnabled=false;
+  cgServoDirection=0;
+  disablePulse(CG_SERVO_CHANNEL);
+}
+void stopOutputs() { ++epoch; autoMotorAllowed=false; stopServoOutput(); stopEscOutput(); stopCgServoOutput(); }
 void latchFault(const char *reason) {
   if (!fault[0]) { fault = reason; stopOutputs(); }
 }
@@ -145,7 +228,7 @@ bool imuUsable(uint64_t now) {
 }
 bool imuFresh(uint64_t now) { return imuUsable(now) && now-imu.t<=IMU_FRESH_US; }
 bool recoverableImuFault() {
-  return !fault[0] || !strcmp(fault,"CALIBRATION_MOVED") || !strcmp(fault,"CALIBRATION_DATA") ||
+  return !fault[0] || !strcmp(fault,"CALIBRATION_MOVED") || !strcmp(fault,"CALIBRATION_DATA") || !strcmp(fault,"CALIBRATION_STORAGE") ||
     !strcmp(fault,"HEADING_UNDEFINED") || !strcmp(fault,"IMU_TIMEOUT") ||
     !strcmp(fault,"ATTITUDE_GAP") || !strcmp(fault,"ATTITUDE_INVALID") || !strcmp(fault,"IMU_RESTART") ||
     !strcmp(fault,"MOUNT_CALIBRATION") || !strcmp(fault,"THROTTLE_INVALID") ||
@@ -158,24 +241,26 @@ bool commandNeedsEpoch(const char *command) {
   return !strcmp(command,"auto_motor_enable") || !strcmp(command,"servo_enable") || !strcmp(command,"auto_enable") ||
     !strcmp(command,"esc_config") || !strcmp(command,"esc_arm") ||
     !strcmp(command,"servo") || !strcmp(command,"esc") ||
-    !strcmp(command,"set_mode") || !strcmp(command,"calibrate") ||
+    !strcmp(command,"cg_servo_enable") || !strcmp(command,"cg_servo_jog") ||
+    !strcmp(command,"set_mode") || !strcmp(command,"calibrate") || !strcmp(command,"restore_calibration") ||
     !strcmp(command,"world_zero") || !strcmp(command,"clear_fault") || !strcmp(command,"pid_config") ||
-    !strcmp(command,"select_imu") || !strcmp(command,"tilt_throttle_config");
+    !strcmp(command,"select_imu") || !strcmp(command,"tilt_throttle_config") || !strcmp(command,"servo_calibrate") ||
+    !strcmp(command,"torque_config") || !strcmp(command,"attitude_target");
 }
 bool controllerLeaseExpired() {
   return controlOwner == -1 && millis()-controllerSeenAt >= SESSION_TIMEOUT_MS;
 }
 const char *operatingModeName() { return operatingMode == MODE_MANUAL ? "MANUAL" : "ATTITUDE"; }
 
-// 调用者已持有 stateLock；姿态模式会重新建立静止参考坐标系，
-// 此过程不会启用任何执行器输出。
+// 在用户明确要求时重新测量静止参考坐标系。
 bool beginCalibrationLocked() {
-  if (servoEnabled || escArmed || escArming || !imu.present || !recoverableImuFault()) return false;
+  if (servoEnabled || cgServoEnabled || escArmed || escArming || !imu.present || !recoverableImuFault()) return false;
   autoMotorAllowed=false;
   ++epoch;
   automaticPid.reset();
   for(int k=0;k<3;++k){imu.biasSum[k]=0;accelSum[k]=0;accelSumSq[k]=0;gyroSumSq[k]=0;}
   calibrationRejectedSamples=0;
+  gravityStartupSamples=0;
   imu.calibrationSamples=0;imu.calibrated=false;worldReady=false;attitude.invalidate();correctionActive=false;
   // 只有输出已停止时，显式重新校准才能恢复传感器跟踪类故障，
   // 此处不清除配置或网络等其他故障。
@@ -187,10 +272,10 @@ bool beginCalibrationLocked() {
 const char *controlSourceName(uint8_t source) { return source==SOURCE_IMU1 ? "IMU1" : "IMU2"; }
 uint8_t controlSourceAddress(uint8_t source) { return source==SOURCE_IMU1 ? IMU_ADDRESS : IMU2_ADDRESS; }
 const char *controlSourceLabel(uint8_t source) {
-  return source==SOURCE_IMU1 ? "IMU1 · SuperMini · 0x68" : "IMU2 · 本地 I2C · 0x69";
+  return source==SOURCE_IMU1 ? (IMU1_LOCAL_I2C ? "IMU1 · 本地 I2C · 0x68" : "IMU1 · SuperMini · 0x68") : "IMU2 · 本地 I2C · 0x69";
 }
 const char *controlSourceInterface(uint8_t source) {
-  return source==SOURCE_IMU1 ? "SUPERMINI_UART" : "LOCAL_I2C_IMU2";
+  return source==SOURCE_IMU1 ? (IMU1_LOCAL_I2C ? "LOCAL_I2C_IMU1" : "SUPERMINI_UART") : "LOCAL_I2C_IMU2";
 }
 // 该路传感器此刻是否有可用的采集通道。只看“模块是否存在”，
 // 不因为暂时没有新样本就拒绝切换，采样年龄由遥测如实报告。
@@ -198,7 +283,65 @@ bool controlSourcePresent(uint8_t source) {
   return source==SOURCE_IMU1 ? primaryImu.present : imu2Monitor.present;
 }
 
-// 调用者持有 stateLock。切换只改变数据源，不会重新启动任何输出。
+const char *gravityReferenceKey(){return controlSource==SOURCE_IMU1?"imu1-v1":"imu2-v1";}
+int controlOutwardAxis(){return controlSource==SOURCE_IMU1?IMU1_OUTWARD_AXIS:IMU2_OUTWARD_AXIS;}
+
+bool applyGravityReference(const GravityReference &reference) {
+  for(float bias:reference.bias)if(!isfinite(bias)||fabsf(bias)>=15)return false;
+  float matrix[3][3];
+  if(!buildUprightMount(reference.up,matrix,controlMountYawDeg(controlSource),controlOutwardAxis()))return false;
+  memcpy(mountingMatrix,matrix,sizeof(mountingMatrix));
+  memcpy(imu.bias,reference.bias,sizeof(imu.bias));
+  return true;
+}
+
+void loadGravityReference() {
+  Preferences storage;
+  GravityReference reference{};
+  bool loaded=false;
+  if(storage.begin("tvc-gravity",true)){
+    loaded=storage.getBytesLength(gravityReferenceKey())==sizeof(reference)&&
+           storage.getBytes(gravityReferenceKey(),&reference,sizeof(reference))==sizeof(reference);
+    storage.end();
+  }
+  savedGravityReference=loaded&&applyGravityReference(reference);
+  if(!savedGravityReference){
+    reference={};
+    const float *up=controlSource==SOURCE_IMU1?IMU1_DEFAULT_UP_G:IMU2_DEFAULT_UP_G;
+    memcpy(reference.up,up,sizeof(reference.up));
+    applyGravityReference(reference);
+  }
+  gravityStartupSamples=0;
+}
+
+bool saveGravityReference(const GravityReference &reference) {
+  Preferences storage;
+  if(!storage.begin("tvc-gravity",false))return false;
+  const bool saved=storage.putBytes(gravityReferenceKey(),&reference,sizeof(reference))==sizeof(reference);
+  storage.end();
+  return saved;
+}
+
+bool restoreGravityReference() {
+  Preferences storage;
+  if(!storage.begin("tvc-gravity",false))return false;
+  const char *key=gravityReferenceKey();
+  const bool removed=!storage.isKey(key)||storage.remove(key);
+  storage.end();
+  if(!removed)return false;
+  loadGravityReference();
+  fault="";
+  worldReady=calibrated=imu.calibrated=mountingCalibrated=gimbalTiltValid=correctionActive=false;
+  imu.calibrationSamples=calibrationRejectedSamples=0;
+  attitude.invalidate();
+  controlAttitude.invalidate();
+  automaticPid.reset();
+  lastControlMeasurementUs=0;
+  ++epoch;
+  return true;
+}
+
+// 调用者持有 stateLock。切换只改变数据源，不会重新启动任何输出.
 // 返回 false 表示目标传感器不存在：此时保持原控制源不变，也不清除故障，
 // 由网页显示真实的传感器状态，而不是悄悄换到另一块。
 bool selectControlImuLocked(uint8_t source) {
@@ -211,6 +354,7 @@ bool selectControlImuLocked(uint8_t source) {
   imu=Imu(controlSourceAddress(source));
   imu.present=true;
   imu2ControlConsumed=imu2Monitor.samples;
+  imu1ControlConsumed=imu1Monitor.samples;
   worldReady=calibrated=calibrating=mountingCalibrated=gimbalTiltValid=false;
   attitude=Attitude();controlAttitude=Attitude();
   correctionActive=false;lastControlMeasurementUs=0;
@@ -219,8 +363,7 @@ bool selectControlImuLocked(uint8_t source) {
   calibrationRejectedSamples=0;
   referenceTime=esp_timer_get_time();++referenceId;
   if(sensorFault)fault="";
-  // 姿态模式下，新来源的第一份样本会触发一次新的竖直静止校准。
-  initialControlCalibrationPending=true;
+  loadGravityReference();
   return true;
 }
 
@@ -235,6 +378,37 @@ bool mountingValid() {
   const auto &m=mountingMatrix;
   float d=m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])-m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])+m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
   return fabsf(d-1.0f)<0.001f;
+}
+
+void markGravityReady(uint64_t sampleTime) {
+  mountingCalibrated=imu.calibrated=calibrated=worldReady=true;
+  referenceTime=sampleTime;
+  ++referenceId;
+  auto e=attitude.euler();
+  imu.roll=e.roll;imu.pitch=e.pitch;
+  autoZeroRoll=autoZeroPitch=autoErrorRoll=autoErrorPitch=0;
+  automaticPid.reset();
+  lastControlMeasurementUs=0;
+}
+
+void initializeFromGravity(float normG,uint32_t dtUs) {
+  if(worldReady||calibrating||fault[0]||servoEnabled||cgServoEnabled||escArmed||escArming)return;
+  const float normMps2=normG*EARTH_GRAVITY_MPS2;
+  const bool still=fabsf(normMps2-EARTH_GRAVITY_MPS2)<=0.1f*EARTH_GRAVITY_MPS2&&
+    fabsf(bodyG[0])<15&&fabsf(bodyG[1])<15&&fabsf(bodyG[2])<15;
+  if(!still||dtUs>50000){gravityStartupSamples=0;return;}
+  if(!gravityStartupSamples){
+    memcpy(gravityStartupFirst,bodyA,sizeof(gravityStartupFirst));
+    memset(gravityStartupSum,0,sizeof(gravityStartupSum));
+  }
+  for(int i=0;i<3;++i){
+    if(fabsf(bodyA[i]-gravityStartupFirst[i])>.06f){gravityStartupSamples=0;return;}
+  }
+  for(int i=0;i<3;++i)gravityStartupSum[i]+=bodyA[i];
+  if(++gravityStartupSamples<GRAVITY_STARTUP_SAMPLES)return;
+  const float scale=1.0f/GRAVITY_STARTUP_SAMPLES;
+  if(attitude.initializeFromAccel(scale*gravityStartupSum[0],scale*gravityStartupSum[1],scale*gravityStartupSum[2]))markGravityReady(imu.t);
+  gravityStartupSamples=0;
 }
 
 bool writeRegister(uint8_t address, uint8_t reg, uint8_t value) {
@@ -291,16 +465,13 @@ void acceptControlSample(const float acceleration[3],const float gyro[3],float t
         if (!still) ++calibrationRejectedSamples;
         else { for (int k=0;k<3;++k) {s.biasSum[k]+=s.g[k];gyroSumSq[k]+=s.g[k]*s.g[k];accelSum[k]+=s.a[k];accelSumSq[k]+=s.a[k]*s.a[k];} ++s.calibrationSamples; }
       }
-      if(initialControlCalibrationPending){
-        initialControlCalibrationPending=false;
-        if(operatingMode==MODE_ATTITUDE&&!worldReady&&!calibrating&&!fault[0])beginCalibrationLocked();
-      }
+      initializeFromGravity(norm,dtUs);
 }
 
 void sensorTask(void *) {
   for (;;) {
     PrimaryUart::Sample sample;
-    if(pollPrimaryUart(sample)) {
+    if(!IMU1_LOCAL_I2C && pollPrimaryUart(sample)) {
       xSemaphoreTake(stateLock,portMAX_DELAY);
       for(int k=0;k<3;++k){primaryImu.a[k]=sample.frame.raw[k]/8192.0f;primaryImu.g[k]=sample.frame.raw[k+4]/65.5f;}
       primaryImu.temperature=sample.frame.raw[3]/340.0f+36.53f;
@@ -310,6 +481,28 @@ void sensorTask(void *) {
         imu.present=primaryImu.present;
         acceptControlSample(primaryImu.a,primaryImu.g,primaryImu.temperature,sample.localUs,sample.dtUs,sample.missed);
         primaryImu.pitch=imu.pitch;primaryImu.roll=imu.roll;
+      }
+      xSemaphoreGive(stateLock);
+    }
+    if(IMU1_LOCAL_I2C){
+      sampleImu1Monitor();
+      xSemaphoreTake(stateLock,portMAX_DELAY);
+      primaryImu.present=imu1Monitor.present;
+      primaryImu.errors=primaryImu.readErrors=imu1Monitor.errors;
+      primaryImu.missed=imu1Monitor.missed;
+      if(imu1Monitor.samples!=imu1ControlConsumed && imu1Monitor.fresh(esp_timer_get_time(),IMU2_TIMEOUT_US)){
+        imu1ControlConsumed=imu1Monitor.samples;
+        for(int k=0;k<3;++k){primaryImu.a[k]=imu1Monitor.accelG[k];primaryImu.g[k]=imu1Monitor.gyroDps[k];}
+        primaryImu.temperature=imu1Monitor.temperatureC;
+        primaryImu.t=imu1Monitor.sampleUs;primaryImu.valid=true;primaryImu.count=imu1Monitor.samples;
+        if(controlSource==SOURCE_IMU1){
+          imu.present=primaryImu.present;
+          const uint64_t elapsed=imu.t&&primaryImu.t>imu.t?primaryImu.t-imu.t:5000;
+          const uint32_t dt=elapsed>IMU_TIMEOUT_US?IMU_TIMEOUT_US+1:uint32_t(elapsed);
+          acceptControlSample(primaryImu.a,primaryImu.g,primaryImu.temperature,primaryImu.t,dt,0);
+          imu.missed=primaryImu.missed;
+          primaryImu.pitch=imu.pitch;primaryImu.roll=imu.roll;
+        }
       }
       xSemaphoreGive(stateLock);
     }
@@ -341,7 +534,8 @@ void safetyTask(void *) {
     xSemaphoreTake(stateLock, portMAX_DELAY);
     const uint64_t nowUs = esp_timer_get_time();
     heartbeatWarning=(servoEnabled || escArmed || escArming) && !freshHeartbeat();
-    if ((servoEnabled || escArmed || escArming) && !imuUsable(nowUs)) latchFault("IMU_TIMEOUT");
+    if(torquePrepared && heartbeatWarning)latchFault("TORQUE_HEARTBEAT");
+    if ((servoEnabled || cgServoEnabled || escArmed || escArming) && !imuUsable(nowUs)) latchFault("IMU_TIMEOUT");
     if (autoEnabled && !worldReady) latchFault("WORLD_NOT_READY");
     if (calibrating && millis()-calibrationAt >= 3000) {
       bool enough = imu.present && imu.calibrationSamples >= 300 && calibrationRejectedSamples <= 60 && imuFresh(nowUs);
@@ -351,21 +545,29 @@ void safetyTask(void *) {
         enough=enough && gyroSumSq[k]/n-mg*mg<4.0 && accelSumSq[k]/n-ma*ma<0.0025;
         meanA[k]=ma;
       }
-      float proposedMount[3][3];
-      const bool mountOk=enough && buildUprightMount(meanA,proposedMount,controlMountYawDeg(controlSource));
-      if(mountOk)memcpy(mountingMatrix,proposedMount,sizeof(mountingMatrix));
-      float meanBody[3];toBody(meanA,meanBody);
-      if(enough && mountOk && mountingValid() && attitude.initializeFromAccel(meanBody[0],meanBody[1],meanBody[2])) {
-        mountingCalibrated=true;
-        for(int k=0;k<3;++k)imu.bias[k]=imu.biasSum[k]/imu.calibrationSamples;
-        imu.calibrated=true;calibrated=true;worldReady=true;referenceTime=nowUs;++referenceId;
-        if(!strcmp(fault,"CALIBRATION_MOVED") || !strcmp(fault,"CALIBRATION_DATA") || !strcmp(fault,"HEADING_UNDEFINED")) fault="";
-        auto e=attitude.euler();imu.roll=e.roll;imu.pitch=e.pitch;
-        autoZeroRoll=e.roll;autoZeroPitch=e.pitch;autoErrorRoll=autoErrorPitch=0;
-        automaticPid.reset();
-        lastControlMeasurementUs=0;
-        float corrected[3];for(int k=0;k<3;++k)corrected[k]=imu.g[k]-imu.bias[k];toBody(corrected,bodyG);
-      } else {worldReady=false;latchFault(enough&&!mountOk?"MOUNT_CALIBRATION":(calibrationRejectedSamples>60?"CALIBRATION_MOVED":"CALIBRATION_DATA"));}
+      GravityReference proposed{};
+      if(enough)for(int k=0;k<3;++k){
+        proposed.up[k]=meanA[k];
+        proposed.bias[k]=imu.biasSum[k]/imu.calibrationSamples;
+      }
+      if(!enough)latchFault(calibrationRejectedSamples>60?"CALIBRATION_MOVED":"CALIBRATION_DATA");
+      else if(!applyGravityReference(proposed))latchFault("MOUNT_CALIBRATION");
+      else {
+        float meanBody[3];toBody(meanA,meanBody);
+        if(!attitude.initializeFromAccel(meanBody[0],meanBody[1],meanBody[2]))latchFault("MOUNT_CALIBRATION");
+        else {
+          savedGravityReference=saveGravityReference(proposed);
+          if(savedGravityReference){
+            markGravityReady(nowUs);
+            float corrected[3];for(int k=0;k<3;++k)corrected[k]=imu.g[k]-imu.bias[k];
+            toBody(corrected,bodyG);
+          } else {
+            loadGravityReference();
+            attitude.invalidate();
+            latchFault("CALIBRATION_STORAGE");
+          }
+        }
+      }
       calibrating=false;
     }
     if(actuatorPwmFault)latchFault("PWM_INIT");
@@ -376,7 +578,14 @@ void safetyTask(void *) {
         const bool newMeasurement=imu.t!=lastControlMeasurementUs;
         gimbalTiltValid=projectHistory(attitude,bodyG,ageUs,HISTORY_PREDICTION_US,controlAttitude) &&
                         gimbalLean(controlAttitude.rotation(),autoErrorPitch,autoErrorRoll);
-        if (autoEnabled && servoEnabled) {
+        if(torqueActive){
+          auto geometry=automaticPid.config();
+          geometry.limit=ELEVATION_MAX_DEFLECTION_DEG;
+          if(!imuFresh(nowUs))latchFault("TORQUE_IMU_STALE");
+          else if(!gimbalTiltValid || !thrustTorque.update(geometry,nowUs,
+                     controlAttitude.rotation(),bodyG,servoActual,servoTarget))latchFault("TORQUE_CONTROL_INVALID");
+          else escTarget=escStop+int(std::lround((escMax-escStop)*thrustTorque.throttlePct*.01f));
+        } else if (autoEnabled && servoEnabled) {
           if(!gimbalTiltValid)latchFault("ATTITUDE_INVALID");
           else if (automaticPid.update(nowUs,autoErrorPitch,autoErrorRoll,
                                   servoActual,servoTarget,newMeasurement&&ageUs<=IMU_FRESH_US)==GimbalPid::INVALID)
@@ -393,17 +602,25 @@ void safetyTask(void *) {
           servoTarget[0]=startupPreposition.goal(0);servoTarget[1]=startupPreposition.goal(1);
           if(startupPreposition.ready(servoActual,millis(),PREPOSITION_SETTLE_MS,imuFresh(nowUs)) && millis()-armAt>=armHold){
             startupPreposition.cancel();prepositionOwnedServos=prepositionResumeAuto=false;
-            automaticPid.reset();autoEnabled=true;
+            automaticPid.reset();autoEnabled=!torquePrepared;
           }
         }
       }
       if(escArming && !startupPreposition.active() && !fault[0] && millis()-armAt>=armHold){escArming=false;escArmed=true;}
       if(tiltThrottleEnabled){
         if(!autoEnabled||!servoEnabled||!escArmed||fault[0]||!gimbalTiltValid)stopEscOutput();
-        else if(!tiltThrottle.update(nowUs,controlAttitude.rotation().m[2][2],imuFresh(nowUs)))latchFault("THROTTLE_INVALID");
+        else if(!tiltThrottle.update(nowUs,controlAttitude.rotation().m[2][2],imuFresh(nowUs),std::hypot(bodyG[0],bodyG[1])))latchFault("THROTTLE_INVALID");
         else escTarget=tiltThrottle.pulse(escStop,escMax);
       }
       if (servoEnabled) for(int i=0;i<2;++i){servoTarget[i]=limitServoUs(i,servoTarget[i]);servoActual[i]=limitServoUs(i,servoActual[i]+constrain(servoTarget[i]-servoActual[i],-SERVO_SLEW_US_PER_TICK,SERVO_SLEW_US_PER_TICK));pulse(i,servoActual[i]);}
+      if (cgServoEnabled && cgServoDirection) {
+        if (millis()-cgServoJogAt>=CG_SERVO_JOG_TIMEOUT_MS) cgServoDirection=0;
+        else {
+          cgServoUs=constrain(cgServoUs+cgServoDirection*CG_SERVO_SLEW_US,CG_SERVO_MIN_US,CG_SERVO_MAX_US);
+          pulse(CG_SERVO_CHANNEL,cgServoUs);
+          if((cgServoDirection>0&&cgServoUs==CG_SERVO_MAX_US)||(cgServoDirection<0&&cgServoUs==CG_SERVO_MIN_US))cgServoDirection=0;
+        }
+      }
       if (escArmed) {escActual+=constrain(escTarget-escActual,-5,5);pulse(2,escActual);}
     }
     xSemaphoreGive(stateLock);
@@ -449,15 +666,13 @@ void handleFrame(char *line, int source) {
     else {
       stopOutputs();controlOwner=source;strlcpy(sessionId,sid,sizeof(sessionId));
       lastCommandSeq=request;heartbeatAt=controllerSeenAt=millis();
-      // 获取控制权不会取消正在进行的静止校准。
-      if(operatingMode==MODE_ATTITUDE && !worldReady && !calibrating && !fault[0] && imu.present)
-        beginCalibrationLocked();
       ok=true;reason="HELLO";
     }
   } else if(controlOwner!=source || strcmp(sid,sessionId) || !doc["boot"].is<const char*>() || strcmp(doc["boot"].as<const char*>(),bootId)) reason="SESSION_MISMATCH";
   else if(request<=lastCommandSeq) reason="OLD_SEQUENCE";
   else if(strcmp(command,"stop") && strcmp(command,"auto_disable") && strcmp(command,"auto_motor_disable") && strcmp(command,"tilt_throttle_disable") &&
-    strcmp(command,"esc_stop") && strcmp(command,"servo_disable") && (!doc["device_t_us"].is<uint64_t>() ||
+    strcmp(command,"esc_stop") && strcmp(command,"servo_disable") &&
+    strcmp(command,"cg_servo_hold") && strcmp(command,"cg_servo_disable") && (!doc["device_t_us"].is<uint64_t>() ||
     doc["device_t_us"].as<uint64_t>()>uint64_t(esp_timer_get_time())+100000 ||
     uint64_t(esp_timer_get_time())>doc["device_t_us"].as<uint64_t>()+COMMAND_MAX_AGE_US))reason="STALE_COMMAND";
   else {
@@ -476,8 +691,8 @@ void handleFrame(char *line, int source) {
     } else if(!strcmp(command,"set_mode")) {
       if(!doc["mode"].is<const char*>())reason="INVALID_MODE";
       else if(!strcmp(doc["mode"].as<const char*>(),"ATTITUDE")) {
-        stopOutputs();operatingMode=MODE_ATTITUDE;calibrating=false;
-        ok=beginCalibrationLocked();reason=ok?"MODE_ATTITUDE_CALIBRATING":"IMU_NOT_READY";
+        stopOutputs();operatingMode=MODE_ATTITUDE;
+        ok=true;reason="MODE_ATTITUDE";
       } else if(!strcmp(doc["mode"].as<const char*>(),"MANUAL")) {
         stopOutputs();calibrating=false;operatingMode=MODE_MANUAL;
         // 手动开环测试不要求世界坐标系已校准；切换到此模式时，
@@ -494,15 +709,34 @@ void handleFrame(char *line, int source) {
       else{ok=true;reason="IMU_SOURCE_SELECTED";}
     } else if(!strcmp(command,"calibrate")) {
       if(!imu.present)reason="IMU_NOT_READY";
-      else if(servoEnabled||escArmed||escArming)reason="STOP_OUTPUTS_FIRST";
+      else if(servoEnabled||cgServoEnabled||escArmed||escArming)reason="STOP_OUTPUTS_FIRST";
       else if(beginCalibrationLocked()){ok=true;reason="CALIBRATING";}
       else reason="FAULT_REQUIRES_RESTART";
+    } else if(!strcmp(command,"restore_calibration")) {
+      if(servoEnabled||cgServoEnabled||escArmed||escArming||calibrating)reason="STOP_OUTPUTS_FIRST";
+      else if(!recoverableImuFault())reason="FAULT_REQUIRES_RESTART";
+      else if(restoreGravityReference()){ok=true;reason="CALIBRATION_DEFAULT_RESTORED";}
+      else reason="CALIBRATION_STORAGE";
     } else if(!strcmp(command,"world_zero")) {
       if(servoEnabled||escArmed||escArming||calibrating)reason="STOP_OUTPUTS_FIRST";
       else if(!worldReady||!imuFresh(esp_timer_get_time()))reason="WORLD_NOT_READY";
       else if(fabsf(bodyG[0])>2||fabsf(bodyG[1])>2||fabsf(bodyG[2])>2)reason="KEEP_STILL";
       else if(!attitude.resetYaw())reason="HEADING_UNDEFINED";
       else{automaticPid.reset();referenceTime=esp_timer_get_time();++referenceId;++epoch;ok=true;reason="WORLD_HEADING_ZEROED";}
+    } else if(!strcmp(command,"servo_calibrate")) {
+      if(servoEnabled||escArmed||escArming||calibrating)reason="STOP_OUTPUTS_FIRST";
+      else if(!doc["azimuth_deg"].is<float>()||!isfinite(doc["azimuth_deg"].as<float>())||doc["azimuth_deg"].as<float>()<0||doc["azimuth_deg"].as<float>()>360||!integerIn(doc["elevation_deg"],140,210)||
+              !doc["azimuth_reversed"].is<bool>()||!doc["elevation_reversed"].is<bool>())reason="SERVO_CALIBRATION_RANGE";
+      else {
+        const ServoCalibration proposed{uint16_t(lroundf(doc["azimuth_deg"].as<float>()*10)),doc["elevation_deg"].as<uint16_t>(),
+          doc["azimuth_reversed"].as<bool>(),doc["elevation_reversed"].as<bool>()};
+        if(!saveServoCalibration(proposed))reason="SERVO_CALIBRATION_SAVE";
+        else {
+          applyServoCalibration(proposed);
+          ++epoch;++configRevision;
+          ok=true;reason="SERVO_CALIBRATION_SAVED";
+        }
+      }
     } else if(!strcmp(command,"pid_config")) {
       if(servoEnabled||escArmed||escArming||calibrating)reason="STOP_OUTPUTS_FIRST";
       else {
@@ -518,11 +752,44 @@ void handleFrame(char *line, int source) {
         }
         GimbalPid proposed(next);
         if(!numbers||next.x.kp>10||next.y.kp>10||next.x.ki>2||next.y.ki>2||next.x.kd>2||next.y.kd>2||!proposed.configurationValid())reason="PID_CONFIG";
+        else if(next.azimuthZero!=GIMBAL_AZIMUTH_ZERO_DEG)reason="USE_SERVO_CALIBRATION";
         else{automaticPid=proposed;++epoch;ok=true;reason="PID_CONFIGURED";}
       }
+    } else if(!strcmp(command,"torque_config")) {
+      if(operatingMode!=MODE_ATTITUDE)reason="MODE_LOCKED";
+      else if(servoEnabled||escArmed||escArming||calibrating)reason="STOP_OUTPUTS_FIRST";
+      else {
+        const char *keys[]={"full_torque_nm","base_pct","max_pct","kp_x","ki_x","kd_x","kp_y","ki_y","kd_y"};
+        bool numbers=true;
+        for(const char *key:keys)numbers=numbers&&doc[key].is<float>();
+        ThrustTorqueConfig next;
+        next.fullTorqueNm=doc["full_torque_nm"].as<float>();
+        next.basePct=doc["base_pct"].as<float>();next.maximumPct=doc["max_pct"].as<float>();
+        next.gains[0]={doc["kp_x"].as<float>(),doc["ki_x"].as<float>(),doc["kd_x"].as<float>()};
+        next.gains[1]={doc["kp_y"].as<float>(),doc["ki_y"].as<float>(),doc["kd_y"].as<float>()};
+        if(doc.containsKey("feedforward")){
+          const auto values=doc["feedforward"].as<JsonArrayConst>();
+          numbers=numbers&&values.size()==6;
+          for(int i=0;i<6;++i)numbers=numbers&&values[i].is<float>();
+          for(int k=0;k<2;++k){
+            next.trimNm[k]=values[k].as<float>();
+            for(int j=0;j<2;++j)next.gravityNmPerDeg[k][j]=values[2+2*k+j].as<float>();
+          }
+        }
+        if(!numbers||!thrustTorque.configure(next))reason="TORQUE_CONFIG";
+        else{++epoch;ok=true;reason="TORQUE_CONFIGURED";}
+      }
+    } else if(!strcmp(command,"attitude_target")) {
+      if(operatingMode!=MODE_ATTITUDE)reason="MODE_LOCKED";
+      else if(!ready || !worldReady || !gimbalTiltValid)reason="NOT_READY";
+      else if((escArmed||escArming)&&!torquePrepared)reason="STOP_ESC_FIRST";
+      else if(torquePrepared&&!torqueActive)reason="PREPOSITION_ACTIVE";
+      else if(!doc["x_deg"].is<float>() || !doc["y_deg"].is<float>() ||
+              !thrustTorque.setTarget(doc["x_deg"].as<float>(),doc["y_deg"].as<float>()))reason="TARGET_RANGE";
+      else{++epoch;ok=true;reason="TARGET_ACCEPTED";}
     } else if(!strcmp(command,"servo_enable")) {
       if(operatingMode!=MODE_MANUAL)reason="MODE_LOCKED";
-      else if(ready && !servoEnabled){automaticPid.reset();servoEnabled=true;autoEnabled=false;++epoch;for(int i=0;i<2;++i){servoActual[i]=servoTarget[i]=SERVO_CENTER_US;pulse(i,SERVO_CENTER_US);}ok=true;reason="SERVO_ENABLED";}else reason="NOT_READY";
+      else if(ready && !servoEnabled){automaticPid.reset();autoEnabled=false;++epoch;enableServosAtCenter();ok=true;reason="SERVO_ENABLED";}else reason="NOT_READY";
     } else if(!strcmp(command,"servo_disable")) {
       if(operatingMode!=MODE_MANUAL)reason="MODE_LOCKED";
       else{++epoch;stopServoOutput();ok=true;reason="SERVO_DISABLED";}
@@ -533,6 +800,31 @@ void handleFrame(char *line, int source) {
       else if(!integerIn(doc["x"],SERVO_MIN_US,SERVO_MAX_US))reason="RANGE";
       else if(!integerIn(doc["y"],ELEVATION_MIN_US,ELEVATION_MAX_US))reason="ELEVATION_LIMIT";
       else{servoTarget[0]=doc["x"];servoTarget[1]=doc["y"];ok=true;reason="SERVO_ACCEPTED";}
+    } else if(!strcmp(command,"cg_servo_enable")) {
+      if(escArmed||escArming)reason="STOP_ESC_FIRST";
+      else if(!ready)reason="NOT_READY";
+      else {
+        pulse(CG_SERVO_CHANNEL,cgServoUs);
+        if(actuatorPwmFault){latchFault("PWM_INIT");reason="PWM_INIT";}
+        else{cgServoEnabled=true;ok=true;reason="CG_SERVO_ENABLED";}
+      }
+    } else if(!strcmp(command,"cg_servo_jog")) {
+      const auto direction=doc["direction"];
+      if(escArmed||escArming)reason="STOP_ESC_FIRST";
+      else if(!ready||!cgServoEnabled)reason="NOT_READY";
+      else if(!direction.is<int>()||(direction.as<int>()!=1&&direction.as<int>()!=-1))reason="RANGE";
+      else {
+        cgServoDirection=direction.as<int>();
+        if((cgServoDirection>0&&cgServoUs>=CG_SERVO_MAX_US)||(cgServoDirection<0&&cgServoUs<=CG_SERVO_MIN_US))cgServoDirection=0;
+        cgServoJogAt=millis();
+        ok=true;reason="CG_SERVO_JOG";
+      }
+    } else if(!strcmp(command,"cg_servo_hold")) {
+      cgServoDirection=0;
+      ok=true;reason="CG_SERVO_HOLD";
+    } else if(!strcmp(command,"cg_servo_disable")) {
+      if(escArmed||escArming)reason="STOP_ESC_FIRST";
+      else{stopCgServoOutput();ok=true;reason="CG_SERVO_DISABLED";}
     } else if(!strcmp(command,"esc_config")) {
       if(!motorModeAllowed())reason="MODE_LOCKED";
       else if(escArmed||escArming)reason="STOP_ESC_FIRST";
@@ -540,7 +832,12 @@ void handleFrame(char *line, int source) {
       else if(doc["min_us"].as<int>()>=doc["stop_us"].as<int>() || doc["max_us"].as<int>()<=doc["stop_us"].as<int>())reason="STOP_NOT_INSIDE_RANGE";
       else {++epoch;stopEscOutput();disablePulse(2);escSignalEnabled=false;escActual=escTarget=0;escStop=doc["stop_us"];escMin=doc["min_us"];escMax=doc["max_us"];armHold=doc["hold_ms"];escConfigured=true;++configRevision;ok=true;reason="ESC_CONFIGURED";}
     } else if(!strcmp(command,"esc_arm")) {
+      const bool useTorque=doc["thrust_torque"].as<bool>();
       if(!motorModeAllowed())reason="MODE_LOCKED";
+      else if(doc.containsKey("thrust_torque")&&!doc["thrust_torque"].is<bool>())reason="TORQUE_CONFIG";
+      else if(useTorque&&(operatingMode!=MODE_ATTITUDE||!thrustTorque.config().valid()))reason="TORQUE_CONFIG";
+      else if(useTorque&&!freshHeartbeat())reason="TORQUE_NOT_READY";
+      else if(cgServoDirection)reason="CG_SERVO_MOVING";
       else if(!ready||!escConfigured)reason="NOT_READY";
       else if(!doc["config_rev"].is<uint32_t>()||doc["config_rev"].as<uint32_t>()!=configRevision)reason="CONFIG_MISMATCH";
       else if(operatingMode==MODE_ATTITUDE && (!worldReady||!mountingCalibrated||!gimbalTiltValid||!imuFresh(esp_timer_get_time())))reason="WORLD_NOT_READY";
@@ -548,10 +845,17 @@ void handleFrame(char *line, int source) {
         ++epoch;stopEscOutput();
         if(operatingMode==MODE_ATTITUDE){
           prepositionOwnedServos=!servoEnabled;prepositionResumeAuto=autoEnabled;
-          if(!servoEnabled){servoEnabled=true;for(int i=0;i<2;++i){servoActual[i]=servoTarget[i]=SERVO_CENTER_US;pulse(i,SERVO_CENTER_US);}}
+          if(!servoEnabled)enableServosAtCenter();
           autoEnabled=false;automaticPid.reset();
-          if(!startupPreposition.begin(automaticPid.config(),autoErrorPitch,autoErrorRoll,servoActual)){stopOutputs();reason="PID_INVALID";}
-          else prepositionAt=millis();
+          int goal[2];
+          auto geometry=automaticPid.config();
+          geometry.limit=ELEVATION_MAX_DEFLECTION_DEG;
+          const bool positioned=useTorque ?
+            thrustTorque.prepare(geometry,autoErrorPitch,autoErrorRoll,servoActual,goal) &&
+              startupPreposition.beginAt(autoErrorPitch,autoErrorRoll,goal) :
+            startupPreposition.begin(automaticPid.config(),autoErrorPitch,autoErrorRoll,servoActual);
+          if(!positioned){stopOutputs();reason=useTorque?"TORQUE_CONFIG":"PID_INVALID";}
+          else{prepositionAt=millis();torquePrepared=useTorque;}
         }
         if(operatingMode==MODE_MANUAL || startupPreposition.active()){
           escSignalEnabled=true;escActual=escTarget=escStop;pulse(2,escStop);escArming=true;armAt=millis();ok=true;reason="ARMING";
@@ -559,7 +863,7 @@ void handleFrame(char *line, int source) {
       }
     } else if(!strcmp(command,"esc")) {
       if(!motorModeAllowed())reason="MODE_LOCKED";
-      else if(tiltThrottleEnabled)reason="AUTO_THROTTLE_ACTIVE";
+      else if(tiltThrottleEnabled||torquePrepared)reason="AUTO_THROTTLE_ACTIVE";
       else if(!ready||!escArmed)reason="NOT_ARMED";
       else if(!doc["epoch"].is<uint32_t>()||doc["epoch"].as<uint32_t>()!=epoch)reason="OLD_EPOCH";
       else if(!integerIn(doc["us"],escMin,escMax))reason="RANGE";
@@ -581,18 +885,26 @@ void handleFrame(char *line, int source) {
       else {
         const char *keys[]={"base_pct","gain_pct_deg","max_pct","deadband_deg","ramp_pct_s"};bool numbers=true;
         for(const char *key:keys)numbers=numbers&&doc[key].is<float>()&&isfinite(doc[key].as<float>());
-        TiltThrottle proposed;proposed.config={doc["base_pct"].as<float>(),doc["gain_pct_deg"].as<float>(),doc["max_pct"].as<float>(),doc["deadband_deg"].as<float>(),doc["ramp_pct_s"].as<float>()};
+        const auto rateGain=doc["rate_gain_pct_dps"];
+        numbers=numbers&&(!doc.containsKey("rate_gain_pct_dps")||rateGain.is<float>());
+        TiltThrottle proposed;proposed.config={doc["base_pct"].as<float>(),doc["gain_pct_deg"].as<float>(),doc["max_pct"].as<float>(),doc["deadband_deg"].as<float>(),doc["ramp_pct_s"].as<float>(),rateGain.as<float>()};
         if(!numbers||!proposed.valid())reason="THROTTLE_CONFIG";
         else{tiltThrottle=proposed;++epoch;ok=true;reason="THROTTLE_CONFIGURED";}
       }
     } else if(!strcmp(command,"auto_enable")) {
+      const bool useTorque=doc["thrust_torque"].as<bool>();
       if(operatingMode!=MODE_ATTITUDE)reason="MODE_LOCKED";
       else if(startupPreposition.active())reason="PREPOSITION_ACTIVE";
+      else if(doc.containsKey("thrust_torque")&&!doc["thrust_torque"].is<bool>())reason="TORQUE_CONFIG";
+      else if(useTorque!=torquePrepared)reason="TORQUE_NOT_READY";
+      else if(useTorque&&(!escArmed||!servoEnabled||!imuFresh(esp_timer_get_time())||
+                          doc["tilt_throttle"].as<bool>()))reason="TORQUE_NOT_READY";
       else if(!doc["tilt_throttle"].isNull()&&!doc["tilt_throttle"].is<bool>())reason="THROTTLE_CONFIG";
       else if(!ready||!worldReady||!mountingCalibrated||!gimbalTiltValid||((escArmed||escArming)&&!autoMotorAllowed))reason="NOT_READY";
       else if(doc["tilt_throttle"].as<bool>()&&(!autoMotorAllowed||!escArmed||escArming||!escConfigured||!tiltThrottle.valid()))reason="THROTTLE_NOT_READY";
       else{tiltThrottle.reset();tiltThrottleEnabled=doc["tilt_throttle"].as<bool>();++epoch;
-        if(!autoEnabled){automaticPid.reset();autoEnabled=true;if(!servoEnabled){servoEnabled=true;for(int i=0;i<2;++i){servoActual[i]=servoTarget[i]=SERVO_CENTER_US;pulse(i,SERVO_CENTER_US);}}}
+        if(useTorque&&!torqueActive){thrustTorque.reset();torqueActive=true;}
+        if(!autoEnabled){automaticPid.reset();autoEnabled=true;if(!servoEnabled)enableServosAtCenter();}
         ok=true;reason="AUTO_ENABLED";}
     } else if(!strcmp(command,"auto_disable")) {
       if(operatingMode!=MODE_ATTITUDE)reason="MODE_LOCKED";
@@ -612,7 +924,8 @@ void appendPidTelemetry(JsonObject item, const AnglePid &pid) {
 void appendImuSource(JsonObject item,const Imu &s,uint8_t source,uint64_t now,float rateHz) {
   const bool usable=imuSampleUsable(s,now,IMU_TIMEOUT_US);
   const uint64_t age=s.t&&now>=s.t?now-s.t:IMU_TIMEOUT_US;
-  const bool local=source==SOURCE_IMU2;
+  const bool local=source==SOURCE_IMU2 || IMU1_LOCAL_I2C;
+  const auto &monitor=source==SOURCE_IMU1?imu1Monitor:imu2Monitor;
   item["address"]=s.address;item["source_id"]=source;
   item["source"]=controlSourceInterface(source);
   // 同一时刻只有一路为 true；网页据此标注“控制源 / 校验”。
@@ -628,15 +941,18 @@ void appendImuSource(JsonObject item,const Imu &s,uint8_t source,uint64_t now,fl
   // 状态要区分“模块没接”“还没收到第一帧”“数据过期”和“读取出错”，
   // 不能用同一个 STALE 掩盖真实原因。
   item["status"]=!s.present?(local?"NOT_FOUND":(primaryReplies?"C3_NOT_FOUND":"WAIT_C3"))
-    :usable?"OK":s.count?"STALE":(local?(imu2Monitor.errors?"READ_ERROR":"WAIT_INT"):"WAIT_SAMPLE");
+    :usable?"OK":s.count?"STALE":(local?(monitor.errors?"READ_ERROR":"WAIT_INT"):"WAIT_SAMPLE");
   item["pitch"]=s.pitch;item["roll"]=s.roll;item["temperature"]=s.temperature;
   item["calibration_samples"]=s.calibrationSamples;
   item["calibration_rejected"]=source==controlSource?calibrationRejectedSamples:0;
-  if(source==SOURCE_IMU1){
+  if(source==SOURCE_IMU1 && !IMU1_LOCAL_I2C){
     item["uart_replies"]=primaryReplies;item["uart_bad_frames"]=primaryBadFrames;
     item["uart_rejected"]=primaryRejected;item["uart_timeouts"]=primaryTimeouts;item["c3_boot"]=primaryRemoteBoot;
   }else{
-    item["i2c_errors"]=imu2Monitor.errors;item["irq_missed"]=imu2Monitor.missed;
+    item["i2c_errors"]=monitor.errors;item["irq_missed"]=monitor.missed;
+    item["int_pin"]=source==SOURCE_IMU1?IMU1_INT_PIN:IMU2_INT_PIN;
+    item["irq_count"]=source==SOURCE_IMU1?uint32_t(imu1IrqCount):uint32_t(imu2IrqCount);
+    item["sda_pin"]=SDA_PIN;item["scl_pin"]=SCL_PIN;
   }
   auto a=item.createNestedArray("a"),g=item.createNestedArray("g"),bias=item.createNestedArray("bias");
   for(int k=0;k<3;++k){a.add(s.a[k]);g.add(s.g[k]-s.bias[k]);bias.add(s.bias[k]);}
@@ -670,6 +986,14 @@ void telemetry() {
   doc["control_source_label"]=controlSourceLabel(controlSource);
   auto outputs=doc.createNestedObject("outputs");outputs["servo_enabled"]=servoEnabled;
   auto servo=outputs.createNestedArray("servo_us");servo.add(servoActual[0]);servo.add(servoActual[1]);
+  // servo_us 保留逻辑舵角指令的脉宽表示，供 Studio 和历史记录计算角度。
+  auto servoPwm=outputs.createNestedArray("servo_pwm_us");
+  for(int k=0;k<2;++k)servoPwm.add(servoEnabled?servoOutputUs(k,servoActual[k]):0);
+  auto cgServo=outputs.createNestedObject("cg_servo");
+  cgServo["enabled"]=cgServoEnabled;
+  cgServo["command_us"]=cgServoUs;
+  cgServo["max_us"]=CG_SERVO_MAX_US;
+  cgServo["direction"]=cgServoDirection;
   outputs["esc_configured"]=escConfigured;outputs["esc_armed"]=escArmed;outputs["esc_arming"]=escArming;outputs["esc_us"]=escActual;
   outputs["esc_signal_enabled"]=escSignalEnabled;
   outputs["esc_stop_us"]=escStop;outputs["esc_min_us"]=escMin;outputs["esc_max_us"]=escMax;
@@ -680,16 +1004,36 @@ void telemetry() {
   control["source_label"]=controlSourceLabel(controlSource);
   auto error=control.createNestedArray("error_deg");error.add(autoErrorRoll);error.add(autoErrorPitch);
   auto zero=control.createNestedArray("zero_deg");zero.add(autoZeroRoll);zero.add(autoZeroPitch);
-  control["algorithm"]="VECTOR_PID";control["geometry"]="AZIMUTH_ELEVATION";
+  control["algorithm"]=torqueActive?"THRUST_TORQUE":"VECTOR_PID";control["geometry"]="AZIMUTH_ELEVATION";
+  auto torque=control["thrust_torque"].to<JsonObject>();
+  torque["active"]=torqueActive;torque["prepared"]=torquePrepared;
+  torque["limited"]=thrustTorque.limited;
+  torque["azimuth_rewind"]=thrustTorque.rewinding();
+  torque["throttle_target_pct"]=thrustTorque.throttlePct;
+  auto target=torque["target_deg"].to<JsonArray>();
+  auto lean=torque["lean_deg"].to<JsonArray>();
+  auto demand=torque["requested_nm"].to<JsonArray>();
+  auto allocated=torque["allocated_nm"].to<JsonArray>();
+  lean.add(autoErrorPitch);lean.add(autoErrorRoll);
+  for(int k=0;k<2;++k){
+    target.add(thrustTorque.target()[k]);demand.add(thrustTorque.requestedNm[k]);allocated.add(thrustTorque.allocatedNm[k]);
+  }
   control["mount_ready"]=mountingCalibrated;control["tilt_valid"]=gimbalTiltValid;
+  control["gravity_reference"]=savedGravityReference?"MANUAL":"DEFAULT";
   control["mount_yaw_deg"]=controlMountYawDeg(controlSource);
   auto ranges=outputs.createNestedArray("servo_range_deg");ranges.add(360);ranges.add(270);
   auto elevationLimits=outputs.createNestedArray("elevation_limits_deg");elevationLimits.add(ELEVATION_MIN_DEG);elevationLimits.add(ELEVATION_MAX_DEG);
   auto throttle=control.createNestedObject("tilt_throttle");
   throttle["enabled"]=tiltThrottleEnabled;throttle["tilt_deg"]=tiltThrottle.tilt;throttle["target_pct"]=tiltThrottle.requested;throttle["output_pct"]=tiltThrottle.percent;
+  throttle["rate_dps"]=tiltThrottle.rate;throttle["rate_gain_pct_dps"]=tiltThrottle.config.rateGain;
   throttle["base_pct"]=tiltThrottle.config.base;throttle["gain_pct_deg"]=tiltThrottle.config.gain;throttle["max_pct"]=tiltThrottle.config.maximum;throttle["deadband_deg"]=tiltThrottle.config.deadband;throttle["ramp_pct_s"]=tiltThrottle.config.ramp;
   auto angles=outputs.createNestedArray("servo_deg");for(int k=0;k<2;++k)angles.add(GimbalPid::usToAngle(servoActual[k],k));
   const auto &cfg=automaticPid.config();
+  auto calibration=control.createNestedObject("servo_calibration");
+  calibration["azimuth_deg"]=servoCalibration.azimuthTenths/10.0f;
+  calibration["elevation_deg"]=servoCalibration.elevationDeg;
+  calibration["azimuth_reversed"]=bool(servoCalibration.azimuthReversed);
+  calibration["elevation_reversed"]=bool(servoCalibration.elevationReversed);
   control["model_enabled"]=cfg.model.enabled;
   control["azimuth_zero_deg"]=cfg.azimuthZero;control["sign_x"]=cfg.signX;control["sign_y"]=cfg.signY;
   auto mount=control.createNestedArray("mount_matrix");for(int r=0;r<3;++r)for(int c=0;c<3;++c)mount.add(mountingMatrix[r][c]);
@@ -737,13 +1081,16 @@ void onNetworkDisconnect(uint8_t client) {
 }
 
 void setup() {
-  for(int i=0;i<3;++i)disablePulse(i);
+  for(int i=0;i<=CG_SERVO_CHANNEL;++i)disablePulse(i);
   Serial.begin(SERIAL_BAUD);
   snprintf(bootId,sizeof(bootId),"%08lx%08lx",(unsigned long)esp_random(),(unsigned long)esp_random());
   stateLock=xSemaphoreCreateMutex();
+  loadServoCalibration();
+  loadGravityReference();
   if(!automaticPid.configurationValid())latchFault("PID_CONFIG");
   Wire.begin(SDA_PIN,SCL_PIN,400000);Wire.setTimeOut(3);
-  beginPrimaryUart();
+  if(IMU1_LOCAL_I2C)beginImu1Monitor();
+  else beginPrimaryUart();
   beginImu2Monitor();
   xTaskCreatePinnedToCore(sensorTask,"sensors",4096,nullptr,2,nullptr,1);
   xTaskCreatePinnedToCore(safetyTask,"safety",4096,nullptr,3,nullptr,0);
@@ -766,6 +1113,6 @@ void loop() {
   }
   const uint32_t interval=controlOwner==-1?SERIAL_TELEMETRY_INTERVAL_MS:WIFI_TELEMETRY_INTERVAL_MS;
   if(millis()-telemetryAt>=interval){telemetryAt=millis();if(controlOwner!=-2)telemetry();}
-  printPrimaryDebug();
+  if(!IMU1_LOCAL_I2C)printPrimaryDebug();
   delay(1);
 }

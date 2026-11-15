@@ -9,7 +9,7 @@ function makeSession(){
 const S={mode:null,port:null,reader:null,writer:null,ws:null,token:'',session:makeSession(),seq:0,boot:'',epoch:0,rev:0,tele:null,lastRx:0,pending:new Map(),generation:0,heartbeat:false,view:'auto',connecting:false,writeChain:Promise.resolve(),faultShown:'',deviceFirmware:'',action:0,operation:null,stopping:0,controlChain:Promise.resolve(),healthPending:false,lastKeepalive:0,autoFanWanted:false};
 const ESC={stop_us:1500,min_us:1300,max_us:1700,hold_ms:3000,hz:50,confirmed:true};
 // 预览模块只有 DOM 与数学接口，没有 command()/串口/WebSocket 的访问权限。
-const attitudePreview=createAttitudePreview({get:$,settings:()=>settingsFromPacket(S.tele)||{kp_x:.6,kp_y:.6,sign_x:1,sign_y:1,max_tilt_deg:15,azimuth_zero_deg:180}});
+const attitudePreview=createAttitudePreview({get:$,settings:()=>settingsFromPacket(S.tele)||{kp_x:.6,kp_y:.6,sign_x:1,sign_y:-1,max_tilt_deg:15,azimuth_zero_deg:180}});
 Object.assign(S,{trend:[],trendBoot:'',trendReference:0,pidDirty:false,autoThrottleWanted:false,faultSnapshot:null,warningShown:''});
 const angleToUs=servoAngleToUs;
 const usToAngle=(us,channel)=>servoUsToAngle(us,channel).toFixed(1);
@@ -99,13 +99,15 @@ function resetSession(){
 }
 function faultDescription(p){
   const m=p.control_imu||{};
-  const link=p.control.source_id===2?`IMU2 本地 I2C，读取错误 ${m.read_errors??0}，丢帧 ${m.missed??0}`:`IMU1 串口回复 ${m.uart_replies??0}，串口坏帧 ${m.uart_bad_frames??0}，串口超时 ${m.uart_timeouts??0}`;
+  const local=m.source?.startsWith('LOCAL_I2C'),source=p.control.source_id;
+  const link=local?`IMU${source} 本地 I2C，状态 ${m.status??'未知'}，INT GPIO${m.int_pin??'未知'}，中断 ${m.irq_count??'未提供'}，读取错误 ${m.read_errors??0}，丢帧 ${m.missed??0}`:`IMU1 串口回复 ${m.uart_replies??0}，串口坏帧 ${m.uart_bad_frames??0}，串口超时 ${m.uart_timeouts??0}`;
   const detail=`${link}；有效样本 ${m.calibration_samples??'—'}/300，剔除 ${m.calibration_rejected??'—'}，读取错误累计 ${m.read_errors??'—'}`;
   if(!p.fault&&p.warning==='HEARTBEAT_TIMEOUT')return `心跳超时告警：本项不停止输出，也不取消控制操作；心跳恢复后自动解除。最近心跳年龄 ${p.heartbeat_age_ms??'—'}ms。`;
   if(p.fault==='HEARTBEAT_TIMEOUT')return '当前主控将心跳超时作为停机故障处理。需要上传2.4.2主控，才能改为仅告警。';
   if(p.fault==='PID_INVALID')return 'PID 输入、参数或控制周期检查未通过，全部输出已停止。可能涉及控制间隔超过50ms、姿态输入非有限或指令范围异常；此总故障码还不能区分具体触发项。';
-  if(p.fault==='CALIBRATION_DATA')return `校准未通过（CALIBRATION_DATA）：${detail}。请保持静止，检查主IMU接线后重新建立坐标系；样本足够时还需检查数据波动。`;
-  if(p.fault==='IMU_TIMEOUT')return p.control.source_id===2?`IMU2 在历史窗口内无有效新样本，输出已停止。检查本地 SDA9、SCL10、INT8、AD0 高电平及供电，恢复后重新校准。`:`IMU1 在历史窗口内无有效新样本，输出已停止。检查采集板供电、TX6→RX16、TX17→RX7及共地，恢复后重新校准。${detail}`;
+  if(p.fault==='CALIBRATION_DATA')return m.calibration_samples===0?`校准没有收到有效样本（CALIBRATION_DATA）：${detail}。先检查传感器供电、I2C 地址和 INT 接线；零读取错误也可能是尚未触发读取。恢复采样后重新校准。`:`校准未通过（CALIBRATION_DATA）：${detail}。请保持静止后重新校准；样本足够时还需检查数据波动。`;
+  if(p.fault==='CALIBRATION_MOVED')return `校准时数据不够稳定（CALIBRATION_MOVED）：${detail}。固定箭体、停止振动后重新进行竖直静止校准。`;
+  if(p.fault==='IMU_TIMEOUT')return local?`IMU${source} 在历史窗口内无有效新样本，输出已停止。检查 SDA${m.sda_pin??9}、SCL${m.scl_pin??10}、INT GPIO${m.int_pin??'未知'}、AD0 电平及供电，恢复采样后重新校准。${detail}`:`IMU1 在历史窗口内无有效新样本，输出已停止。检查采集板供电、TX6→RX16、TX17→RX7及共地，恢复后重新校准。${detail}`;
   if(p.fault==='IMU_RESTART')return '采集板已重启（IMU_RESTART），输出已停止。请保持竖直静止并重新校准。';
   if(p.fault==='MOUNT_CALIBRATION')return '安装校准未通过：箭头朝上、箭体保持竖直，MPU6050 板面沿箭体竖直后重新校准。';
   if(p.fault==='ATTITUDE_INVALID')return '姿态数据无效，输出已停止。请检查当前 IMU 的数据，恢复后重新校准。';
@@ -129,7 +131,7 @@ async function copyFault(){
   const p=displayedFault();if(!p?.fault&&!p?.warning)return;
   const data={fault:p.fault,warning:p.warning||'',heartbeat_age_ms:p.heartbeat_age_ms,firmware:p.firmware,boot:p.boot,state:p.state,operating_mode:p.operating_mode,control_source:p.control.source_id,t_us:p.t_us,
     snapshot:!S.tele,telemetry_fresh:!!S.tele&&fresh(),first_received:S.faultSnapshot?.received,
-    imu:p.control_imu,mount:{ready:p.control.mount_ready,yaw_deg:p.control.mount_yaw_deg,sensor_to_body:p.control.mount_matrix},world_valid:p.world.valid,pid:p.control.pid,outputs:p.outputs,
+    imu:p.control_imu,imus:p.imus,imu2:p.imu2,mount:{ready:p.control.mount_ready,yaw_deg:p.control.mount_yaw_deg,sensor_to_body:p.control.mount_matrix},world_valid:p.world.valid,pid:p.control.pid,outputs:p.outputs,
     note:p.fault?'这是故障后的遥测；PID复位后的dt可能为0，不能据此认定原始触发原因。':'当前为告警；控制不会因这项告警中断。'};
   const text=JSON.stringify(data,null,2),field=$('fault-copy-text');field.value=text;
   try{if(!navigator.clipboard?.writeText)throw Error('CLIPBOARD_UNAVAILABLE');await navigator.clipboard.writeText(text);field.hidden=true;$('fault-copy-status').textContent='故障信息已复制，可直接粘贴到聊天中。';}
@@ -157,7 +159,7 @@ async function connectUsb(){
   finally{S.connecting=false;render();}
 }
 async function connectWifi(){
-  if(location.hostname!=='192.168.4.1'){location.href='http://192.168.4.1/?ui=2.4.3';return;}
+  if(location.hostname!=='192.168.4.1'){location.href='http://192.168.4.1/?ui=2.4.6';return;}
   if(S.connecting||S.mode)return;S.connecting=true;render();
   try{
     const response=await fetch('/api/device',{cache:'no-store'});if(!response.ok)throw new Error(`设备信息 HTTP ${response.status}`);
@@ -317,16 +319,20 @@ function renderImu2(packet,isFresh){
   $('imu2-accel').textContent=view.live?formatVector(packet.imu2?.a_g,3):'— / — / —';
   $('imu2-gyro').textContent=view.live?formatVector(packet.imu2?.g_dps,2):'— / — / —';
 }
-// IMU1（采集板 0x68）始终显示为校验卡片：它是否参与 PID 由固件 control.source_id 决定。
+// IMU1（0x68）显示实际采集通道；它是否参与 PID 由固件 control.source_id 决定。
 function renderImu1(packet,isFresh){
   const s=packet?.imus?.[0],live=!!(isFresh&&s?.valid);
-  const status={OK:'正常',STALE:'数据过期',WAIT_SAMPLE:'等待样本',WAIT_C3:'等待采集板',C3_NOT_FOUND:'采集板未找到IMU',NOT_FOUND:'未检测到'}[s?.status]||'异常';
+  const local=s?.source==='LOCAL_I2C_IMU1'||!packet;
+  const status={OK:'正常',STALE:'数据过期',WAIT_INT:'等待中断',READ_ERROR:'读取异常',WAIT_SAMPLE:'等待样本',WAIT_C3:'等待采集板',C3_NOT_FOUND:'采集板未找到IMU',NOT_FOUND:'未检测到'}[s?.status]||'异常';
+  $('imu1-title').textContent=local?'IMU1 · 本地 I2C · 0x68':'IMU1 · SuperMini · 0x68';
+  $('imu1-interface').textContent=local?'CHANNEL 1 · I2C':'CHANNEL 1 · UART';
+  $('imu1-link-label').textContent=local?'读取错误 / 中断计数':'串口回复 / 坏帧';
   $('imu1-status').textContent=!packet?'等待连接':!isFresh?'数据过期':status;
   $('imu1-status').classList.toggle('live',live);
   $('imu1-age').textContent=live?`${Math.max(0,(packet.t_us-s.sample_t_us)/1000).toFixed(1)} ms`:'—';
   $('imu1-rate').textContent=live&&Number.isFinite(s.sample_hz)?`${s.sample_hz.toFixed(1)} Hz`:'—';
   $('imu1-temp').textContent=live&&Number.isFinite(s.temperature)?`${s.temperature.toFixed(1)} ℃`:'— ℃';
-  $('imu1-uart').textContent=live?`${s.uart_replies??0} / ${s.uart_bad_frames??0}`:'— / —';
+  $('imu1-uart').textContent=!isFresh||!s?'— / —':local?`${s.read_errors??0} / ${s.irq_count??'—'}`:live?`${s.uart_replies??0} / ${s.uart_bad_frames??0}`:'— / —';
   $('imu1-accel').textContent=live?formatVector(s.a,3):'— / — / —';
   $('imu1-gyro').textContent=live?formatVector(s.g,2):'— / — / —';
   $('imu1-role').textContent=packet?.control?.source_id===1?'当前控制源；原始轴数据（安装矩阵变换前）':'备用监测；不参与当前 PID';
@@ -345,16 +351,17 @@ async function applyPid(){
 function renderDetails(p,isFresh,connected,busy){
   const sensor=isFresh?p?.control_imu:null;
   const source=p?.control?.source_id??2;
-  $('current-imu-title').textContent=source===2?'IMU2 · 主控本地 I2C · 0x69':'IMU1 · SuperMini · 0x68';
-  $('current-error-label').textContent=source===2?'读取错误 / 丢帧':'读取错误 / 串口超时';
+  $('current-imu-title').textContent=source===2?'IMU2 · 主控本地 I2C · 0x69':p?.control_imu?.source==='LOCAL_I2C_IMU1'?'IMU1 · 主控本地 I2C · 0x68':'IMU1 · SuperMini · 0x68';
+  const localSource=source===2||p?.control_imu?.source==='LOCAL_I2C_IMU1';
+  $('current-error-label').textContent=localSource?'读取错误 / 丢帧':'读取错误 / 串口超时';
   $('primary-gyro').textContent=formatVector(sensor?.g,2);$('primary-accel').textContent=formatVector(sensor?.a,3);
   $('primary-temp').textContent=Number.isFinite(sensor?.temperature)?`${sensor.temperature.toFixed(1)} ℃`:'— ℃';
-  $('primary-errors').textContent=sensor?`${sensor.read_errors??0} / ${(source===2?sensor.missed:sensor.uart_timeouts)??0}`:'— / —';
+  $('primary-errors').textContent=sensor?`${sensor.read_errors??0} / ${(localSource?sensor.missed:sensor.uart_timeouts)??0}`:'— / —';
   $('primary-age').textContent=sensor?`${((p.t_us-sensor.sample_t_us)/1000).toFixed(1)} ms`:'等待数据';
   $('primary-rate').textContent=sensor&&Number.isFinite(sensor.sample_hz)?`${sensor.sample_hz.toFixed(1)} Hz`:'— Hz';
   $('primary-sample-age').textContent=sensor?`${Math.max(0,(p.t_us-sensor.sample_t_us)/1000).toFixed(1)} ms`:'— ms';
   $('primary-history').textContent=sensor?({LIVE:'实时',PREDICTED:'历史估算',HELD:'历史保持',UNAVAILABLE:'已失效'})[sensor.history_state]||'—':'—';
-  $('primary-interface').textContent=sensor?`${sensor.source==='LOCAL_I2C_IMU2'?'LOCAL_I2C':'SUPERMINI_UART'} / 0x${Number(sensor.address).toString(16)}`:'—';
+  $('primary-interface').textContent=sensor?`${sensor.source.startsWith('LOCAL_I2C')?'LOCAL_I2C':'SUPERMINI_UART'} / 0x${Number(sensor.address).toString(16)}`:'—';
   const pid=isFresh?p?.control?.pid:null;
   for(const axis of ['x','y'])for(const [cell,key] of [['p','p_deg'],['i','i_deg'],['d','d_deg'],['out','output_deg']])$('pid-'+axis+'-'+cell).textContent=Number.isFinite(pid?.[axis]?.[key])?pid[axis][key].toFixed(2):'—';
   $('pid-interval').textContent=Number.isFinite(pid?.dt_s)?`${(pid.dt_s*1000).toFixed(1)} ms`:'— ms';
@@ -400,8 +407,10 @@ function render(){
   // 切换开关只在输出停止、未在校准时可用；切换本身也会让固件先停止输出。
   $('use-imu2').checked=source===2;$('use-imu2').disabled=!(connected&&isFresh&&!busy&&!outputsActive()&&!p?.calibrating);
   $('active-source-name').textContent=source===2?'IMU2 · 0x69':'IMU1 · 0x68';
-  $('active-source-path').textContent=source===2?'主控本地 I2C':'SuperMini → UART → 主控';
-  $('source-state').textContent=!connected?'默认 IMU2；连接后以设备回传为准':busy&&S.operation?.kind==='source'?'正在切换，输出保持停止':p?.calibrating?`页面选择 IMU${source} · 固件生效 IMU${source} · 竖直校准中`:`页面选择 IMU${source} · 固件生效 IMU${source}（${source===2?'本地 I2C 0x69':'SuperMini 0x68'}）`;
+  const primaryLocal=!p||p.imus?.[0]?.source==='LOCAL_I2C_IMU1';
+  $('imu1-source-label').textContent=primaryLocal?'IMU1 · 本地 I2C':'IMU1 · SuperMini';
+  $('active-source-path').textContent=source===2||primaryLocal?'主控本地 I2C':'SuperMini → UART → 主控';
+  $('source-state').textContent=!connected?'默认 IMU2；连接后以设备回传为准':busy&&S.operation?.kind==='source'?'正在切换，输出保持停止':p?.calibrating?`页面选择 IMU${source} · 固件生效 IMU${source} · 竖直校准中`:`页面选择 IMU${source} · 固件生效 IMU${source}（${source===2?'本地 I2C 0x69':primaryLocal?'本地 I2C 0x68':'SuperMini 0x68'}）`;
   const mountYaw=p?.control?.mount_yaw_deg;
   $('mounting-state').textContent=!isFresh?'安装偏角等待设备回传':!Number.isFinite(mountYaw)?'当前固件未报告安装偏角；请上传 2.4.3 主控':`IMU${source} 安装偏角 ${mountYaw}° · ${p.control.mount_ready?'已纳入姿态与 PID':'等待竖直校准'}（俯视逆时针为正）`;
   $('imu2-role').textContent=source===2?'当前控制源；下列为本地原始校验数据':'备用监测；不参与当前 PID';

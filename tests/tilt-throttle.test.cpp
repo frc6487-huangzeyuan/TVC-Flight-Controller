@@ -16,6 +16,10 @@ int main(){
   for(int i=0;i<200;i++){now+=10000;t.update(now,z(100),true);expect(t.pulse(1500,1700)>=1500&&t.pulse(1500,1700)<=1560,"PWM never exceeds 30 percent of forward span");}
   for(int i=0;i<400;i++){now+=10000;t.update(now,1,true);}expect(std::fabs(t.percent)<.001&&t.pulse(1500,1700)==1500,"upright body ramps back to base zero");
   t.config.base=5;now+=10000;t.update(now,z(1),true);expect(t.requested==5,"nonzero base is retained inside deadband");
+  t.config.rateGain=.02f;
+  now+=10000;t.update(now,z(1),true,50);
+  expect(std::fabs(t.requested-6)<.001&&t.rate==50,"transverse rate adds throttle inside the tilt deadband");
+  expect(!t.update(now,z(1),true,NAN),"nonfinite transverse rate rejected");
   expect(!t.update(now+100000,z(10),true),"control scheduler gap rejected");
   t.reset();expect(t.percent==0&&t.requested==0,"reset clears all throttle state");
   expect(!t.update(now,NAN,true),"nonfinite orientation rejected");

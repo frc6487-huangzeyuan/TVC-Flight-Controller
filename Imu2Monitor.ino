@@ -1,5 +1,5 @@
 // IMU2 原始采集；选中 IMU2 时，sensorTask 将新样本交给姿态估计与 PID。
-// 只使用原主控本地 I2C：SDA=9、SCL=10；IMU2 的 AD0=3.3 V、地址=0x69、INT=GPIO8。
+// 本地 I2C：SDA=9、SCL=10；IMU2 的 AD0=3.3 V、地址=0x69、INT=GPIO2。
 // 本模块本身不发送执行器指令。
 
 Imu2MonitorState imu2Monitor;
@@ -99,6 +99,10 @@ void appendImu2Telemetry(JsonObject item, uint64_t now) {
   item["sample_hz"] = valid ? roundf(sampleHz*10.0f)/10.0f : 0;
   item["errors"] = sample.errors;
   item["missed"] = sample.missed;
+  item["int_pin"] = IMU2_INT_PIN;
+  item["irq_count"] = uint32_t(imu2IrqCount);
+  item["sda_pin"] = SDA_PIN;
+  item["scl_pin"] = SCL_PIN;
   item["tilt_valid"] = valid && sample.tiltValid;
   auto acceleration=item.createNestedArray("a_g");
   auto gyro=item.createNestedArray("g_dps");

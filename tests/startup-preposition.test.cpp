@@ -27,5 +27,10 @@ int main(){
   cfg.signX=-1;assert(p.begin(cfg,5,0,sent));assert(p.goal(1)==firstGoal);
   cfg.signX=1;assert(p.begin(cfg,100,100,sent));
   assert(std::fabs(GimbalPid::usToAngle(p.goal(1),1)-135)<=15.1f);
-  std::puts("PASS startup target, PWM dwell, stale measurement and cancellation");
+  cfg.azimuthZero=230;
+  sent[0]=GimbalPid::angleToUs(cfg.azimuthZero,0);sent[1]=1500;
+  assert(sent[0]==1778);
+  assert(p.begin(cfg,0,0,sent)&&p.goal(0)==1778&&p.goal(1)==1500);
+  assert(p.begin(cfg,-5,0,sent)&&p.goal(0)==1778&&p.goal(1)>1500);
+  std::puts("PASS startup target, calibrated azimuth, PWM dwell, stale measurement and cancellation");
 }

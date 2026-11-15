@@ -3,23 +3,25 @@
 #include <cstdint>
 
 // 油门百分比是“停止脉宽→正向最大脉宽”的比例，不是测得的 RPM 或推力。
-struct TiltThrottleConfig {float base=0,gain=1,maximum=30,deadband=2,ramp=10;};
+struct TiltThrottleConfig {float base=0,gain=1,maximum=30,deadband=2,ramp=10,rateGain=0;};
 class TiltThrottle {
  public:
   TiltThrottleConfig config;
-  float requested=0,percent=0,tilt=0;
+  float requested=0,percent=0,tilt=0,rate=0;
   bool valid()const{
     const auto &c=config;
-    return std::isfinite(c.base)&&std::isfinite(c.gain)&&std::isfinite(c.maximum)&&std::isfinite(c.deadband)&&std::isfinite(c.ramp)&&
-      c.base>=0&&c.base<=c.maximum&&c.maximum<=100&&c.maximum>0&&c.gain>=0&&c.gain<=5&&c.deadband>=0&&c.deadband<=30&&c.ramp>=1&&c.ramp<=100;
+    return std::isfinite(c.base)&&std::isfinite(c.gain)&&std::isfinite(c.maximum)&&std::isfinite(c.deadband)&&std::isfinite(c.ramp)&&std::isfinite(c.rateGain)&&
+      c.base>=0&&c.base<=c.maximum&&c.maximum<=100&&c.maximum>0&&c.gain>=0&&c.gain<=5&&c.deadband>=0&&c.deadband<=30&&c.ramp>=1&&c.ramp<=100&&c.rateGain>=0&&c.rateGain<=5;
   }
-  void reset(){requested=percent=tilt=0;previousUs_=0;}
-  bool update(uint64_t now,float bodyZWorldZ,bool fresh){
-    if(!valid()||!std::isfinite(bodyZWorldZ)||!now)return false;
+  void reset(){requested=percent=tilt=rate=0;previousUs_=0;}
+  // 使用与倾倒有关的横向角速度，绕纵轴的自旋不参与油门计算。
+  bool update(uint64_t now,float bodyZWorldZ,bool fresh,float tiltRateDps=0){
+    if(!valid()||!std::isfinite(bodyZWorldZ)||!std::isfinite(tiltRateDps)||tiltRateDps<0||!now)return false;
     const float z=bodyZWorldZ<-1?-1:bodyZWorldZ>1?1:bodyZWorldZ;
     tilt=std::acos(z)*57.29577951308232f;
+    rate=tiltRateDps;
     const float error=tilt>config.deadband?tilt-config.deadband:0;
-    requested=std::fmin(config.maximum,config.base+config.gain*error);
+    requested=std::fmin(config.maximum,config.base+config.gain*error+config.rateGain*rate);
     if(!previousUs_){previousUs_=now;return true;}
     if(now<previousUs_||now-previousUs_>50000)return false;
     const float step=config.ramp*float(now-previousUs_)/1e6f;

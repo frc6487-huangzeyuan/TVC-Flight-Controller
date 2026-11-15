@@ -13,27 +13,27 @@ int main(){
   expect(near(mount[0][2],1)&&near(mount[1][0],1),"outward PCB normal defines X and a right-handed Y");
   gravity[0]=0;gravity[1]=0;gravity[2]=1;
   expect(!buildUprightMount(gravity,mount),"horizontal PCB contradicts the required mounting reference");
-  // 两块斜面上的 IMU 对同一真实横向向量必须给出相同机体分量。
+  // 同一 PCB、同面同向的 IMU 必须把相同传感器向量映射到相同机体分量。
   // 已知传感器重力为 +Y 时，朝外法线为传感器 +Z，水平切向为传感器 +X。
   gravity[0]=0;gravity[1]=1;gravity[2]=0;
   const float half=std::sqrt(.5f);
-  const float golden[2][3][3]={{{half,0,-half},{-half,0,-half},{0,1,0}},
+  const float golden[2][3][3]={{{half,0,half},{half,0,-half},{0,1,0}},
                               {{half,0,half},{half,0,-half},{0,1,0}}};
-  expect(near(controlMountYawDeg(SOURCE_IMU1),-135)&&near(controlMountYawDeg(SOURCE_IMU2),-45),"IMU1 is clockwise 90 degrees from the IMU2 -45 degree face");
+  expect(near(controlMountYawDeg(SOURCE_IMU1),-45)&&near(controlMountYawDeg(SOURCE_IMU2),-45),"coplanar aligned IMUs share the existing IMU2 mounting reference");
   for(int source=SOURCE_IMU1;source<=SOURCE_IMU2;++source){
     expect(buildUprightMount(gravity,mount,controlMountYawDeg(source)),"each source uses its own yaw mounting angle");
     for(int row=0;row<3;++row)for(int col=0;col<3;++col)
-      expect(near(mount[row][col],golden[source-1][row][col]),"mounting rotation matches the independent octagon-face matrix");
+      expect(near(mount[row][col],golden[source-1][row][col]),"mounting rotation matches the independent coplanar matrix");
     for(int row=0;row<3;++row)for(int other=0;other<3;++other){
       float dot=0;for(int col=0;col<3;++col)dot+=mount[row][col]*mount[other][col];
       expect(near(dot,row==other?1:0),"mounting remains orthonormal after yaw correction");
     }
-    const float sensorPlusX[2][3]={{half,0,-half},{half,0,half}};
-    const float sensorPlusY[2][3]={{-half,0,-half},{half,0,-half}};
+    const float sensorPlusX[2][3]={{half,0,half},{half,0,half}};
+    const float sensorPlusY[2][3]={{half,0,-half},{half,0,-half}};
     for(int row=0;row<3;++row){
       float bx=0,by=0,vertical=0;
       for(int col=0;col<3;++col){bx+=mount[row][col]*sensorPlusX[source-1][col];by+=mount[row][col]*sensorPlusY[source-1][col];vertical+=mount[row][col]*gravity[col];}
-      expect(near(bx,row==0?1:0)&&near(by,row==1?1:0),"same physical X/Y vector maps identically for both sensor faces");
+      expect(near(bx,row==0?1:0)&&near(by,row==1?1:0),"identical raw X/Y test vectors map identically for both IMUs");
       expect(near(vertical,row==2?1:0),"yaw correction preserves upright gravity and total tilt");
     }
   }
@@ -74,5 +74,14 @@ int main(){
   expect(std::fabs(integral.x().terms().i)<.3f&&std::fabs(integral.y().terms().i)<.3f,"vector saturation and slew inhibit integral windup");
   c=config();c.signX=0;expect(!GimbalPid(c).configurationValid(),"invalid direction is rejected");
   c=config();c.limit=90;expect(!GimbalPid(c).configurationValid(),"unreviewed large deflection is rejected");
+  // Check the PCB defaults through both startup and the running control path.
+  c=config();c.azimuthZero=GIMBAL_AZIMUTH_ZERO_DEG;c.signX=GIMBAL_VECTOR_X_SIGN;c.signY=GIMBAL_VECTOR_Y_SIGN;c.stepUs=SERVO_SLEW_US_PER_TICK;
+  float vx,vy;GimbalPid::initialVector(c,2,3,vx,vy);
+  expect(near(vx,-2)&&near(vy,3),"PCB Y correction reverses while X keeps its original direction");
+  GimbalPid pcbPid(c);actual[0]=actual[1]=1500;
+  for(int i=0;i<500;++i){expect(pcbPid.update(1000000+10000*i,2,3,actual,target)!=GimbalPid::INVALID,"PCB direction update remains valid");for(int k=0;k<2;++k)actual[k]=target[k];}
+  az=GimbalPid::usToAngle(actual[0],0);el=GimbalPid::usToAngle(actual[1],1);
+  float direction=(az-c.azimuthZero)*.0174532925199433f;
+  expect(near((el-135)*std::cos(direction),-2,.2f)&&near((el-135)*std::sin(direction),3,.2f),"running PWM maps to the same corrected X/Y vector as startup");
   std::printf("PASS %d gimbal geometry and PID checks; no physical hardware used.\n",checks);
 }

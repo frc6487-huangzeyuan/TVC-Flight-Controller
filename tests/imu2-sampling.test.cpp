@@ -30,7 +30,7 @@ void portENTER_CRITICAL_ISR(int*){}
 void portEXIT_CRITICAL_ISR(int*){}
 void xSemaphoreTake(int,int){}
 void xSemaphoreGive(int){}
-void pinMode(int pin,int mode){expect(pin==8&&mode==INPUT_PULLDOWN,"IMU2 pin input only");}
+void pinMode(int pin,int mode){expect(pin==2&&mode==INPUT_PULLDOWN,"PCB IMU2 uses GPIO2 input only");}
 int digitalPinToInterrupt(int pin){return pin;}
 void attachInterrupt(int pin,void(*)(),int edge){
   ++attachCalls;lastIntPin=pin;expect(edge==RISING,"rising data-ready interrupt");
@@ -54,8 +54,8 @@ int main(){
   expect(PRIMARY_UART_RX==16&&PRIMARY_UART_TX==17&&IMU_TIMEOUT_US==2000000,"primary UART pins and history protection preserved");
   expect(IMU2_SAMPLE_HZ==200&&IMU2_TIMEOUT_US==300000,"secondary configured for control sampling");
   beginImu2Monitor();
-  expect(initCalls==1&&attachCalls==1&&lastIntPin==8&&imu2Monitor.present,
-         "configured secondary attaches to GPIO8");
+  expect(initCalls==1&&attachCalls==1&&lastIntPin==2&&imu2Monitor.present,
+         "configured secondary attaches to GPIO2");
   imu.present=false;irqCount=1;imu2IrqCount=1;imu2IrqTime=fakeNow;
   sampleImu2Monitor();expect(readCalls==1,"missing primary cannot starve secondary");
   imu.present=true;consumed=irqCount;imu2Monitor=Imu2MonitorState();imu2Monitor.present=true;

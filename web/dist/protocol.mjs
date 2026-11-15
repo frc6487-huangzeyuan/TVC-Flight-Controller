@@ -47,9 +47,10 @@ export function isTelemetry(p){
     const timeout=s?.sample_timeout_us??50000;
     return s&&s.address===address&&s.source===source&&typeof s.valid==='boolean'&&typeof s.present==='boolean'&&vector(s.a)&&vector(s.g)&&Number.isFinite(s.pitch)&&Number.isFinite(s.roll)&&Number.isSafeInteger(s.sample_t_us)&&s.sample_t_us>=0&&s.sample_t_us<=p.t_us&&Number.isSafeInteger(timeout)&&timeout>=50000&&timeout<=2000000&&(!s.valid||(s.present&&p.t_us-s.sample_t_us<timeout));
   };
-  if(!Array.isArray(p.imus)||p.imus.length!==1||!sensorValid(p.imus[0],0x68,'SUPERMINI_UART'))return false;
+  const primarySource=p.imus?.[0]?.source;
+  if(!['SUPERMINI_UART','LOCAL_I2C_IMU1'].includes(primarySource)||!Array.isArray(p.imus)||p.imus.length!==1||!sensorValid(p.imus[0],0x68,primarySource))return false;
   const source=p.control?.source_id;
-  if(![1,2].includes(source)||p.control_imu?.source_id!==source||!sensorValid(p.control_imu,source===1?0x68:0x69,source===1?'SUPERMINI_UART':'LOCAL_I2C_IMU2'))return false;
+  if(![1,2].includes(source)||p.control_imu?.source_id!==source||!sensorValid(p.control_imu,source===1?0x68:0x69,source===1?primarySource:'LOCAL_I2C_IMU2'))return false;
   const w=p.world;
   if(!w||w.frame!=='LOCAL_Z_UP'||typeof w.valid!=='boolean'||w.heading_absolute!==false||!Number.isSafeInteger(w.reference_id)||w.reference_id<0||typeof w.correction_active!=='boolean'||!Number.isFinite(w.reference_age_s)||w.reference_age_s<0)return false;
   if(typeof w.heading_defined!=='boolean'||![w.euler_deg,w.a_body_g,w.gyro_body_dps].every(vector))return false;
@@ -61,7 +62,7 @@ export function isTelemetry(p){
   if(!p.control||typeof p.control.auto_motor_allowed!=='boolean'||p.control.geometry!=='AZIMUTH_ELEVATION'||typeof p.control.mount_ready!=='boolean'||typeof p.control.tilt_valid!=='boolean')return false;
   const o=p.outputs;
   if(!o||typeof o.servo_enabled!=='boolean'||!Array.isArray(o.servo_us)||o.servo_us.length!==2||!o.servo_us.every(Number.isFinite)||typeof o.esc_armed!=='boolean'||typeof o.esc_arming!=='boolean'||typeof o.esc_configured!=='boolean'||typeof o.esc_signal_enabled!=='boolean'||!Number.isFinite(o.esc_us))return false;
-  if(o.servo_range_deg?.[0]!==360||o.servo_range_deg?.[1]!==270||p.imus[0].source!=='SUPERMINI_UART')return false;
+  if(o.servo_range_deg?.[0]!==360||o.servo_range_deg?.[1]!==270)return false;
   if(o.esc_configured&&(!Number.isInteger(o.esc_stop_us)||o.esc_stop_us<900||o.esc_stop_us>2100||!Number.isInteger(o.esc_min_us)||o.esc_min_us<900||o.esc_min_us>=o.esc_stop_us||!Number.isInteger(o.esc_max_us)||o.esc_max_us<=o.esc_stop_us||o.esc_max_us>2100))return false;
   if((o.esc_armed||o.esc_arming)&&(!o.esc_configured||!o.esc_signal_enabled))return false;
   const tt=p.control.tilt_throttle;

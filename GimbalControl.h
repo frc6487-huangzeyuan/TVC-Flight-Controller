@@ -4,19 +4,21 @@
 #include "ServoLimits.h"
 #include <algorithm>
 
-// 照片中的安装：PCB 板面沿箭体竖直，元件面朝外。
+// 用竖直时的加速度和已知外向轴构造安装矩阵，默认外向轴是 PCB +Z。
 // 操作者必须把箭体轴竖直向上再校准。本函数利用此已知姿态建立安装矩阵，
 // 不能从任意静止姿态自动识别箭头方向，也不能用重力识别绕箭体长轴的安装角。
 // yawDegrees 是 PCB 朝外法线在公共机体 XY 平面内的方位：从箭头向尾部看，逆时针为正。
 // 先建立局部 Z=箭体向上、X=PCB 朝外，再用安装角把两块 IMU 转到同一机体坐标系。
-inline bool buildUprightMount(const float gravity[3], float matrix[3][3], float yawDegrees=0) {
+inline bool buildUprightMount(const float gravity[3], float matrix[3][3], float yawDegrees=0,int outwardAxis=2) {
+  if(outwardAxis<0 || outwardAxis>2)return false;
   if (!std::isfinite(yawDegrees) || yawDegrees < -180 || yawDegrees > 180) return false;
   float length = std::sqrt(gravity[0]*gravity[0]+gravity[1]*gravity[1]+gravity[2]*gravity[2]);
   if (!std::isfinite(length) || length < .85f || length > 1.15f) return false;
   float z[3] = {gravity[0]/length,gravity[1]/length,gravity[2]/length};
-  float x[3] = {-z[2]*z[0],-z[2]*z[1],1-z[2]*z[2]};
+  float x[3];
+  for(int i=0;i<3;++i)x[i]=(i==outwardAxis?1.0f:0.0f)-z[outwardAxis]*z[i];
   length = std::sqrt(x[0]*x[0]+x[1]*x[1]+x[2]*x[2]);
-  // PCB 法线与重力方向过于接近，说明不符合“板面竖直”的校准条件。
+  // 外向轴与重力过于接近时无法建立横向基准。
   if (!std::isfinite(length) || length < .7f) return false;
   for (int i=0;i<3;++i) { matrix[0][i]=x[i]/length;matrix[2][i]=z[i]; }
   matrix[1][0]=z[1]*matrix[0][2]-z[2]*matrix[0][1];
@@ -84,7 +86,7 @@ class GimbalPid {
       (config_.signX==1 || config_.signX==-1) && (config_.signY==1 || config_.signY==-1) &&
       config_.stepUs>0 && config_.maxGapUs>=100 && config_.maxGapUs<=50000;
   }
-  void reset() { x_.reset();y_.reset();sampleUs_=0;dt_=0;limited_=false; }
+  void reset() { x_.reset();y_.reset();sampleUs_=0;dt_=0;limited_=false;trackingDirection_=false; }
   const AnglePid &x() const { return x_; }
   const AnglePid &y() const { return y_; }
   float dt() const { return dt_; }
@@ -163,7 +165,15 @@ class GimbalPid {
     if(saturated) { vx*=config_.limit/magnitude;vy*=config_.limit/magnitude; }
     float azimuth,elevation;
     float current=usToAngle(actualUs[0],0);
-    vectorToAngles(vx,vy,current,config_.azimuthZero,azimuth,elevation);
+    // 小幅噪声不驱动方位大角度换向，倾角恢复后使用不同阈值避免边界抖动。
+    const float correctionMagnitude=std::hypot(vx,vy);
+    if(correctionMagnitude<(trackingDirection_?0.5f:1.0f)) {
+      trackingDirection_=false;
+      azimuth=current;elevation=135;
+    } else {
+      trackingDirection_=true;
+      vectorToAngles(vx,vy,current,config_.azimuthZero,azimuth,elevation);
+    }
     // 方位指令还在大幅转向时，先命令俯仰靠近中位，避免指向错误方向。
     // 这是指令状态限制，不是舵机位置反馈，实际跟随速度必须实物核对。
     bool turning=std::fabs(azimuth-current)>5;
@@ -181,6 +191,7 @@ class GimbalPid {
     return UPDATED;
   }
  private:
+  bool trackingDirection_=false;
   GimbalConfig config_;
   AnglePid x_,y_;
   uint64_t sampleUs_;
