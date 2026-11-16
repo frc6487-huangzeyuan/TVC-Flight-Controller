@@ -23,8 +23,7 @@ int servoOutputUs(int channel, int commandUs) {
   if(channel==1)return constrain(output,ELEVATION_PHYSICAL_MIN_US,ELEVATION_PHYSICAL_MAX_US);
   return limitServoUs(channel,output);
 }
-void pulse(int channel, int us) {
-  if(channel<2)us=servoOutputUs(channel,us);
+void writePwmUs(int channel, int us) {
   if (!pwmAttached[channel]) {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
     if(!ledcAttachChannel(pwmPin(channel),PWM_HZ,PWM_BITS,channel)){actuatorPwmFault=true;return;}
@@ -40,6 +39,9 @@ void pulse(int channel, int us) {
 #else
   ledcWrite(channel,duty);
 #endif
+}
+void pulse(int channel, int us) {
+  writePwmUs(channel,channel<2?servoOutputUs(channel,us):us);
 }
 void disablePulse(int channel) {
   if (pwmAttached[channel]) {

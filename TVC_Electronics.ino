@@ -40,6 +40,7 @@
 
 // 在 MotorControl.ino 标签页中实现，通道 0/1 对应云台，2 对应电调，3 对应重心舵机。
 int servoOutputUs(int channel, int commandUs);
+void writePwmUs(int channel, int us);
 void pulse(int channel, int us);
 void disablePulse(int channel);
 void beginImu2Monitor();
@@ -124,11 +125,13 @@ GimbalPid automaticPid(initialGimbalConfig());
 uint32_t armHold = 3000, configRevision = 0, badFrames = 0;
 ServoCalibration servoCalibration{DEFAULT_AZIMUTH_SERVO_CENTER_TENTHS,DEFAULT_ELEVATION_SERVO_CENTER_DEG,0,ELEVATION_SERVO_REVERSED};
 int servoCenterUs[2]={SERVO_CENTER_US,SERVO_CENTER_US};
+ServoTravelSweep servoSweep;
 
 void applyServoCalibration(const ServoCalibration &calibration) {
   servoCalibration=calibration;
   servoCenterUs[0]=GimbalPid::angleToUs(calibration.azimuthTenths/10.0f,0);
   servoCenterUs[1]=constrain(GimbalPid::angleToUs(calibration.elevationDeg,1),ELEVATION_PHYSICAL_MIN_US,ELEVATION_PHYSICAL_MAX_US);
+  for(int axis=0;axis<2;++axis)if(calibration.travel[axis].zero)servoCenterUs[axis]=calibration.travel[axis].zero;
   GimbalConfig config=automaticPid.config();
   config.azimuthZero=GIMBAL_AZIMUTH_ZERO_DEG;
   automaticPid=GimbalPid(config);
@@ -141,17 +144,20 @@ void loadServoCalibration() {
   ServoCalibration calibration=servoCalibration;
   ServoCalibration saved{};
   if(storage.begin("tvc-servo",true)){
-    if(storage.getBytesLength("cal-v6")==sizeof(saved)&&
-       storage.getBytes("cal-v6",&saved,sizeof(saved))==sizeof(saved)&&saved.valid()){
+    constexpr size_t legacySize=offsetof(ServoCalibration,travel);
+    if(storage.getBytesLength("cal-v7")==sizeof(saved)&&
+       storage.getBytes("cal-v7",&saved,sizeof(saved))==sizeof(saved)&&saved.valid()){
       calibration=saved;
     } else {
-      const char *oldKey=storage.getBytesLength("cal-v5")==sizeof(saved)?"cal-v5":storage.getBytesLength("cal-v4")==sizeof(saved)?"cal-v4":storage.getBytesLength("cal-v3")==sizeof(saved)?"cal-v3":storage.getBytesLength("cal-v2")==sizeof(saved)?"cal-v2":"cal-v1";
-      if(storage.getBytesLength(oldKey)==sizeof(saved)&&
-         storage.getBytes(oldKey,&saved,sizeof(saved))==sizeof(saved)&&saved.valid()){
-        // 升级使用 186.8° 方位中位，保留俯仰中位和两轴方向。
-        calibration.elevationDeg=saved.elevationDeg;
-        calibration.azimuthReversed=saved.azimuthReversed;
-        calibration.elevationReversed=saved.elevationReversed;
+      for(int version=6;version>=1;--version){
+        char key[]="cal-v6";
+        key[5]='0'+version;
+        saved={};
+        if(storage.getBytesLength(key)==legacySize&&storage.getBytes(key,&saved,legacySize)==legacySize&&saved.valid()){
+          if(version<6)saved.azimuthTenths=calibration.azimuthTenths;
+          calibration=saved;
+          break;
+        }
       }
     }
     storage.end();
@@ -162,7 +168,7 @@ void loadServoCalibration() {
 bool saveServoCalibration(const ServoCalibration &calibration) {
   Preferences storage;
   if(!storage.begin("tvc-servo",false))return false;
-  const bool saved=storage.putBytes("cal-v6",&calibration,sizeof(calibration))==sizeof(calibration);
+  const bool saved=storage.putBytes("cal-v7",&calibration,sizeof(calibration))==sizeof(calibration);
   storage.end();
   return saved;
 }
@@ -191,6 +197,7 @@ void stopEscOutput();
 void stopServoOutput() {
   if(tiltThrottleEnabled||torquePrepared)stopEscOutput();
   autoEnabled = false; servoEnabled = false;
+  servoSweep={};
   automaticPid.reset();
   disablePulse(0); disablePulse(1);
 }
@@ -245,7 +252,9 @@ bool commandNeedsEpoch(const char *command) {
     !strcmp(command,"set_mode") || !strcmp(command,"calibrate") || !strcmp(command,"restore_calibration") ||
     !strcmp(command,"world_zero") || !strcmp(command,"clear_fault") || !strcmp(command,"pid_config") ||
     !strcmp(command,"select_imu") || !strcmp(command,"tilt_throttle_config") || !strcmp(command,"servo_calibrate") ||
-    !strcmp(command,"torque_config") || !strcmp(command,"attitude_target");
+    !strcmp(command,"torque_config") || !strcmp(command,"attitude_target") ||
+    !strcmp(command,"servo_travel_start") || !strcmp(command,"servo_travel_step") ||
+    !strcmp(command,"servo_travel_zero") || !strcmp(command,"servo_travel_save");
 }
 bool controllerLeaseExpired() {
   return controlOwner == -1 && millis()-controllerSeenAt >= SESSION_TIMEOUT_MS;
@@ -535,6 +544,7 @@ void safetyTask(void *) {
     const uint64_t nowUs = esp_timer_get_time();
     heartbeatWarning=(servoEnabled || escArmed || escArming) && !freshHeartbeat();
     if(torquePrepared && heartbeatWarning)latchFault("TORQUE_HEARTBEAT");
+    if(servoSweep.axis>=0 && heartbeatWarning)stopOutputs();
     if ((servoEnabled || cgServoEnabled || escArmed || escArming) && !imuUsable(nowUs)) latchFault("IMU_TIMEOUT");
     if (autoEnabled && !worldReady) latchFault("WORLD_NOT_READY");
     if (calibrating && millis()-calibrationAt >= 3000) {
@@ -612,7 +622,10 @@ void safetyTask(void *) {
         else if(!tiltThrottle.update(nowUs,controlAttitude.rotation().m[2][2],imuFresh(nowUs),std::hypot(bodyG[0],bodyG[1])))latchFault("THROTTLE_INVALID");
         else escTarget=tiltThrottle.pulse(escStop,escMax);
       }
-      if (servoEnabled) for(int i=0;i<2;++i){servoTarget[i]=limitServoUs(i,servoTarget[i]);servoActual[i]=limitServoUs(i,servoActual[i]+constrain(servoTarget[i]-servoActual[i],-SERVO_SLEW_US_PER_TICK,SERVO_SLEW_US_PER_TICK));pulse(i,servoActual[i]);}
+      if(servoSweep.axis>=0){
+        servoSweep.tick();
+        writePwmUs(servoSweep.axis,servoSweep.current);
+      } else if (servoEnabled) for(int i=0;i<2;++i){servoTarget[i]=limitServoUs(i,servoTarget[i]);servoActual[i]=limitServoUs(i,servoActual[i]+constrain(servoTarget[i]-servoActual[i],-SERVO_SLEW_US_PER_TICK,SERVO_SLEW_US_PER_TICK));pulse(i,servoActual[i]);}
       if (cgServoEnabled && cgServoDirection) {
         if (millis()-cgServoJogAt>=CG_SERVO_JOG_TIMEOUT_MS) cgServoDirection=0;
         else {
@@ -686,6 +699,44 @@ void handleFrame(char *line, int source) {
     else if(!strcmp(command,"keepalive")){ok=true;reason="KEEPALIVE";}
     else if(!strcmp(command,"heartbeat")){heartbeatAt=millis();ok=true;reason="HEARTBEAT";}
     else if(!strcmp(command,"stop")){stopOutputs();calibrating=false;ok=true;reason="STOPPED";}
+    else if(!strcmp(command,"servo_travel_start")){
+      if(servoEnabled||cgServoEnabled||escArmed||escArming)reason="STOP_OUTPUTS_FIRST";
+      else if(!ready||!freshHeartbeat())reason="NOT_READY";
+      else if(!integerIn(doc["axis"],0,1))reason="SERVO_CALIBRATION_RANGE";
+      else {
+        const int axis=doc["axis"].as<int>();
+        stopOutputs();
+        servoSweep.begin(axis,servoCenterUs[axis]);
+        servoEnabled=true;
+        ok=true;reason="SERVO_TRAVEL_STARTED";
+      }
+    } else if(!strcmp(command,"servo_travel_step") || !strcmp(command,"servo_travel_zero") || !strcmp(command,"servo_travel_save")){
+      if(servoSweep.axis<0||!ready||!freshHeartbeat())reason="NOT_READY";
+      else if(servoSweep.current!=servoSweep.target)reason="SERVO_TRAVEL_MOVING";
+      else if(!strcmp(command,"servo_travel_step")){
+        if(!integerIn(doc["delta_us"],-20,20)||!doc["delta_us"].as<int>())reason="SERVO_CALIBRATION_RANGE";
+        else{servoSweep.nudge(doc["delta_us"].as<int>());++epoch;ok=true;reason="SERVO_TRAVEL_STEP";}
+      } else if(!strcmp(command,"servo_travel_zero")){
+        servoSweep.captureZero();++epoch;ok=true;reason="SERVO_TRAVEL_ZERO";
+      } else if(!servoSweep.range.valid(servoSweep.axis))reason="SERVO_TRAVEL_ENDPOINTS";
+      else {
+        ServoCalibration proposed=servoCalibration;
+        const int axis=servoSweep.axis, zero=servoSweep.range.zero;
+        proposed.travel[axis]=servoSweep.range;
+        if(axis==0)proposed.azimuthTenths=lroundf(GimbalPid::usToAngle(zero,0)*10);
+        else proposed.elevationDeg=lroundf(GimbalPid::usToAngle(zero,1));
+        if(!saveServoCalibration(proposed))reason="SERVO_CALIBRATION_SAVE";
+        else {
+          stopOutputs();
+          applyServoCalibration(proposed);
+          ++configRevision;
+          ok=true;reason="SERVO_CALIBRATION_SAVED";
+        }
+      }
+    } else if(servoSweep.axis>=0 && !strcmp(command,"servo_disable")){
+      stopOutputs();ok=true;reason="SERVO_DISABLED";
+    } else if(servoSweep.axis>=0 && strcmp(command,"set_mode") && strcmp(command,"esc_stop"))
+      reason="SERVO_TRAVEL_ACTIVE";
     else if(!strcmp(command,"clear_fault")) {
       if(!servoEnabled && !escArmed && !escArming){fault="";stopOutputs();ok=true;reason="CLEARED";}else reason="STOP_OUTPUTS_FIRST";
     } else if(!strcmp(command,"set_mode")) {
@@ -724,13 +775,16 @@ void handleFrame(char *line, int source) {
       else if(!attitude.resetYaw())reason="HEADING_UNDEFINED";
       else{automaticPid.reset();referenceTime=esp_timer_get_time();++referenceId;++epoch;ok=true;reason="WORLD_HEADING_ZEROED";}
     } else if(!strcmp(command,"servo_calibrate")) {
-      if(servoEnabled||escArmed||escArming||calibrating)reason="STOP_OUTPUTS_FIRST";
+      if(servoEnabled||cgServoEnabled||escArmed||escArming||calibrating)reason="STOP_OUTPUTS_FIRST";
       else if(!doc["azimuth_deg"].is<float>()||!isfinite(doc["azimuth_deg"].as<float>())||doc["azimuth_deg"].as<float>()<0||doc["azimuth_deg"].as<float>()>360||!integerIn(doc["elevation_deg"],140,210)||
               !doc["azimuth_reversed"].is<bool>()||!doc["elevation_reversed"].is<bool>())reason="SERVO_CALIBRATION_RANGE";
       else {
-        const ServoCalibration proposed{uint16_t(lroundf(doc["azimuth_deg"].as<float>()*10)),doc["elevation_deg"].as<uint16_t>(),
+        ServoCalibration proposed{uint16_t(lroundf(doc["azimuth_deg"].as<float>()*10)),doc["elevation_deg"].as<uint16_t>(),
           doc["azimuth_reversed"].as<bool>(),doc["elevation_reversed"].as<bool>()};
-        if(!saveServoCalibration(proposed))reason="SERVO_CALIBRATION_SAVE";
+        proposed.travel[0]=servoCalibration.travel[0];proposed.travel[1]=servoCalibration.travel[1];
+        if((proposed.travel[0].zero&&proposed.azimuthTenths!=servoCalibration.azimuthTenths)||
+           (proposed.travel[1].zero&&proposed.elevationDeg!=servoCalibration.elevationDeg))reason="SERVO_TRAVEL_ZERO_LOCKED";
+        else if(!saveServoCalibration(proposed))reason="SERVO_CALIBRATION_SAVE";
         else {
           applyServoCalibration(proposed);
           ++epoch;++configRevision;
@@ -988,7 +1042,8 @@ void telemetry() {
   auto servo=outputs.createNestedArray("servo_us");servo.add(servoActual[0]);servo.add(servoActual[1]);
   // servo_us 保留逻辑舵角指令的脉宽表示，供 Studio 和历史记录计算角度。
   auto servoPwm=outputs.createNestedArray("servo_pwm_us");
-  for(int k=0;k<2;++k)servoPwm.add(servoEnabled?servoOutputUs(k,servoActual[k]):0);
+  for(int k=0;k<2;++k)servoPwm.add(servoSweep.axis>=0?(servoSweep.axis==k?servoSweep.current:0):
+      (servoEnabled?servoOutputUs(k,servoActual[k]):0));
   auto cgServo=outputs.createNestedObject("cg_servo");
   cgServo["enabled"]=cgServoEnabled;
   cgServo["command_us"]=cgServoUs;
@@ -1034,6 +1089,15 @@ void telemetry() {
   calibration["elevation_deg"]=servoCalibration.elevationDeg;
   calibration["azimuth_reversed"]=bool(servoCalibration.azimuthReversed);
   calibration["elevation_reversed"]=bool(servoCalibration.elevationReversed);
+  auto travel=control.createNestedObject("servo_travel");
+  travel["axis"]=servoSweep.axis;
+  travel["current_us"]=servoSweep.current;travel["target_us"]=servoSweep.target;
+  travel["min_us"]=servoSweep.range.min;travel["zero_us"]=servoSweep.range.zero;travel["max_us"]=servoSweep.range.max;
+  auto savedTravel=travel.createNestedArray("saved_us");
+  for(const auto &range:servoCalibration.travel){
+    auto points=savedTravel.createNestedArray();
+    points.add(range.min);points.add(range.zero);points.add(range.max);
+  }
   control["model_enabled"]=cfg.model.enabled;
   control["azimuth_zero_deg"]=cfg.azimuthZero;control["sign_x"]=cfg.signX;control["sign_y"]=cfg.signY;
   auto mount=control.createNestedArray("mount_matrix");for(int r=0;r<3;++r)for(int c=0;c<3;++c)mount.add(mountingMatrix[r][c]);
