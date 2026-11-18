@@ -17,9 +17,10 @@ struct ServoTravelRange {
 struct ServoTravelSweep {
   int axis=-1, current=0, target=0;
   ServoTravelRange range{};
+  bool explicitEndpoints=false;
 
-  void begin(int channel,int center) {
-    axis=channel;current=target=center;range={};
+  void begin(int channel,int center,bool captureEndpoints=false) {
+    axis=channel;current=target=center;range={};explicitEndpoints=captureEndpoints;
   }
   void nudge(int delta) {
     const int next=current+delta, low=ServoTravelRange::lower(axis), high=ServoTravelRange::upper(axis);
@@ -28,12 +29,18 @@ struct ServoTravelSweep {
   void tick() {
     const int delta=target-current;
     current+=delta<-4?-4:delta>4?4:delta;
-    if(range.zero){
+    if(range.zero&&!explicitEndpoints){
       if(current<range.min)range.min=current;
       if(current>range.max)range.max=current;
     }
   }
   void captureZero() { range={uint16_t(current),uint16_t(current),uint16_t(current)}; }
+  bool captureEndpoint(bool high) {
+    if(!explicitEndpoints||!range.zero||(high?current<=range.zero:current>=range.zero))return false;
+    if(high)range.max=uint16_t(current);
+    else range.min=uint16_t(current);
+    return true;
+  }
 };
 
 struct ServoCalibration {
@@ -47,10 +54,9 @@ struct ServoCalibration {
            (travel[0].empty()||travel[0].valid(0)) && (travel[1].empty()||travel[1].valid(1));
   }
 
-  // 指令中位固定为 1500 μs，两侧分别映射到物理行程端点。
-  int outputUs(int channel,int commandUs,int centerUs) const {
-    const int low=servoLowerUs(channel),high=servoUpperUs(channel);
-    int physicalLow=low,physicalHigh=high;
+  // 普通输出的物理 PWM 范围为实测端点与硬限位的交集。
+  ServoTravelRange outputRange(int channel,int centerUs) const {
+    int physicalLow=servoLowerUs(channel),physicalHigh=servoUpperUs(channel);
     if(channel==1) {
       const int minUs=centerUs-ELEVATION_DEFLECTION_US,maxUs=centerUs+ELEVATION_DEFLECTION_US;
       physicalLow=minUs<ELEVATION_PHYSICAL_MIN_US?ELEVATION_PHYSICAL_MIN_US:minUs;
@@ -60,11 +66,18 @@ struct ServoCalibration {
       if(travel[channel].min>physicalLow)physicalLow=travel[channel].min;
       if(travel[channel].max<physicalHigh)physicalHigh=travel[channel].max;
     }
+    return {uint16_t(physicalLow),uint16_t(centerUs),uint16_t(physicalHigh)};
+  }
+
+  // 指令中位固定为 1500 μs，两侧分别映射到物理行程端点。
+  int outputUs(int channel,int commandUs,int centerUs) const {
+    const auto range=outputRange(channel,centerUs);
+    const int low=servoLowerUs(channel),high=servoUpperUs(channel);
     const bool reverse=channel==0?azimuthReversed:elevationReversed;
     int offset=limitServoUs(channel,commandUs)-1500;
     if(reverse)offset=-offset;
     const int inputSpan=offset<0?1500-low:high-1500;
-    const int outputSpan=offset<0?centerUs-physicalLow:physicalHigh-centerUs;
+    const int outputSpan=offset<0?centerUs-range.min:range.max-centerUs;
     const int magnitude=((offset<0?-offset:offset)*outputSpan+inputSpan/2)/inputSpan;
     return centerUs+(offset<0?-magnitude:magnitude);
   }

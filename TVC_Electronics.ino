@@ -254,7 +254,7 @@ bool commandNeedsEpoch(const char *command) {
     !strcmp(command,"select_imu") || !strcmp(command,"tilt_throttle_config") || !strcmp(command,"servo_calibrate") ||
     !strcmp(command,"torque_config") || !strcmp(command,"attitude_target") ||
     !strcmp(command,"servo_travel_start") || !strcmp(command,"servo_travel_step") ||
-    !strcmp(command,"servo_travel_zero") || !strcmp(command,"servo_travel_save");
+    !strcmp(command,"servo_travel_zero") || !strcmp(command,"servo_travel_capture") || !strcmp(command,"servo_travel_save");
 }
 bool controllerLeaseExpired() {
   return controlOwner == -1 && millis()-controllerSeenAt >= SESSION_TIMEOUT_MS;
@@ -706,11 +706,12 @@ void handleFrame(char *line, int source) {
       else {
         const int axis=doc["axis"].as<int>();
         stopOutputs();
-        servoSweep.begin(axis,servoCenterUs[axis]);
+        servoSweep.begin(axis,servoCenterUs[axis],doc["explicit_endpoints"]|false);
         servoEnabled=true;
         ok=true;reason="SERVO_TRAVEL_STARTED";
       }
-    } else if(!strcmp(command,"servo_travel_step") || !strcmp(command,"servo_travel_zero") || !strcmp(command,"servo_travel_save")){
+    } else if(!strcmp(command,"servo_travel_step") || !strcmp(command,"servo_travel_zero") ||
+              !strcmp(command,"servo_travel_capture") || !strcmp(command,"servo_travel_save")){
       if(servoSweep.axis<0||!ready||!freshHeartbeat())reason="NOT_READY";
       else if(servoSweep.current!=servoSweep.target)reason="SERVO_TRAVEL_MOVING";
       else if(!strcmp(command,"servo_travel_step")){
@@ -718,6 +719,11 @@ void handleFrame(char *line, int source) {
         else{servoSweep.nudge(doc["delta_us"].as<int>());++epoch;ok=true;reason="SERVO_TRAVEL_STEP";}
       } else if(!strcmp(command,"servo_travel_zero")){
         servoSweep.captureZero();++epoch;ok=true;reason="SERVO_TRAVEL_ZERO";
+      } else if(!strcmp(command,"servo_travel_capture")){
+        const char *endpoint=doc["endpoint"]|"";
+        if((strcmp(endpoint,"min")&&strcmp(endpoint,"max"))||
+           !servoSweep.captureEndpoint(!strcmp(endpoint,"max")))reason="SERVO_TRAVEL_ENDPOINT_SIDE";
+        else{++epoch;ok=true;reason="SERVO_TRAVEL_ENDPOINT_RECORDED";}
       } else if(!servoSweep.range.valid(servoSweep.axis))reason="SERVO_TRAVEL_ENDPOINTS";
       else {
         ServoCalibration proposed=servoCalibration;
@@ -1091,11 +1097,18 @@ void telemetry() {
   calibration["elevation_reversed"]=bool(servoCalibration.elevationReversed);
   auto travel=control.createNestedObject("servo_travel");
   travel["axis"]=servoSweep.axis;
+  travel["capture_endpoints"]=true;travel["explicit_endpoints"]=servoSweep.explicitEndpoints;
   travel["current_us"]=servoSweep.current;travel["target_us"]=servoSweep.target;
   travel["min_us"]=servoSweep.range.min;travel["zero_us"]=servoSweep.range.zero;travel["max_us"]=servoSweep.range.max;
   auto savedTravel=travel.createNestedArray("saved_us");
   for(const auto &range:servoCalibration.travel){
     auto points=savedTravel.createNestedArray();
+    points.add(range.min);points.add(range.zero);points.add(range.max);
+  }
+  auto effectiveTravel=travel.createNestedArray("effective_us");
+  for(int axis=0;axis<2;++axis){
+    const auto range=servoCalibration.outputRange(axis,servoCenterUs[axis]);
+    auto points=effectiveTravel.createNestedArray();
     points.add(range.min);points.add(range.zero);points.add(range.max);
   }
   control["model_enabled"]=cfg.model.enabled;
