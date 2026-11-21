@@ -33,7 +33,8 @@ class AnglePid {
   // 调用者提供执行器在本次控制周期内能够到达的输出范围，
   // 条件积分同时考虑总行程限制和单周期转动速度限制。
   bool update(float target, float measurement, float dt,
-              float reachableLow, float reachableHigh, bool allowIntegral = true) {
+              float reachableLow, float reachableHigh, bool allowIntegral = true,
+              float actuatorResidual = 0) {
     if (!configurationValid() || !finite(target) || !finite(measurement) ||
         !finite(dt) || dt < 0.0001f || dt > 0.05f ||
         !finite(reachableLow) || !finite(reachableHigh)) return false;
@@ -60,6 +61,7 @@ class AnglePid {
     // 只有积分会把已受限的输出继续推向限幅外侧时，才拒绝这次积分，
     // 反方向的积分仍然可以消除之前积累的偏置。
     if ((allowIntegral || candidate * i < 0 || std::fabs(candidate) <= std::fabs(i)) &&
+        !((candidate-i)*actuatorResidual>0) &&
         !((requested > high && candidate > i) ||
           (requested < low && candidate < i))) i = candidate;
     terms_ = {error, p, i, d, clamp(p+i+d, low, high)};

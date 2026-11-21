@@ -35,5 +35,12 @@ int main(){
     expect(target[1]>=1130&&target[1]<=1870,"PID target never crosses elevation limit");
     for(int k=0;k<2;k++)actual[k]=target[k];
   }
+  {
+    const float up[]={-.1736482f,0,.9848078f};
+    const float falling[]={0,40,0},returning[]={0,-40,0},tangential[]={40,0,0};
+    expect(std::fabs(outwardTiltRateDps(up,falling)-40)<.01f,"increasing tilt adds rate demand");
+    expect(outwardTiltRateDps(up,returning)==0&&outwardTiltRateDps(up,tangential)==0,
+           "returning and tangential speeds do not add rate demand");
+  }
   std::printf("PASS %d throttle, history hold, reset, PWM cap and signed elevation-limit checks; no hardware used.\n",checks);
 }

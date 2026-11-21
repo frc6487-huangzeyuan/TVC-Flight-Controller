@@ -12,3 +12,12 @@ constexpr int ELEVATION_PHYSICAL_MIN_US=1538,ELEVATION_PHYSICAL_MAX_US=2055;
 inline int servoLowerUs(int channel){return channel==1?ELEVATION_MIN_US:500;}
 inline int servoUpperUs(int channel){return channel==1?ELEVATION_MAX_US:2500;}
 inline int limitServoUs(int channel,int us){return us<servoLowerUs(channel)?servoLowerUs(channel):us>servoUpperUs(channel)?servoUpperUs(channel):us;}
+
+struct GimbalTravel {
+  int low[2]={500,ELEVATION_MIN_US},high[2]={2500,ELEVATION_MAX_US};
+  bool calibrated=false;
+
+  int clamp(int axis,int us) const {
+    return us<low[axis]?low[axis]:us>high[axis]?high[axis]:us;
+  }
+};

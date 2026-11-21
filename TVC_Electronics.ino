@@ -1,3 +1,4 @@
+// 版本：tvc-gimbal-2.5.11
 // TVC 实验平台：两路 MPU6050 都可以作为 PID 控制源，由网页明确切换。
 //   本 PCB 两块 MPU6050 共用主控 SDA9/SCL10。
 //   IMU1：AD0=GND，地址 0x68，INT=GPIO8；IMU2：AD0=3.3V，地址 0x69，INT=GPIO2。
@@ -24,7 +25,6 @@
 #include "Attitude.h"
 #include "AutoLevelPid.h"
 #include "GimbalControl.h"
-#include "StartupPreposition.h"
 #include "ThrustTorqueControl.h"
 #include "ServoCalibration.h"
 #include "HistoryAttitude.h"
@@ -80,6 +80,8 @@ portMUX_TYPE irqLock = portMUX_INITIALIZER_UNLOCKED;
 uint32_t primaryReplies=0,primaryBadFrames=0,primaryRejected=0,primaryTimeouts=0;
 uint32_t primaryRemoteBoot=0;
 bool savedGravityReference=false;
+struct GuidedGravityReference {GravityReference gravity;float outward[3];};
+bool guidedMount=false;
 uint8_t gravityStartupSamples=0;
 float gravityStartupFirst[3]={},gravityStartupSum[3]={};
 char bootId[17], sessionId[33] = "";
@@ -88,11 +90,8 @@ bool heartbeatWarning=false; // 心跳超时只告警，不属于会停止执行
 uint32_t lastCommandSeq = 0, txSeq = 0, heartbeatAt = 0, controllerSeenAt = 0, epoch = 0;
 bool servoEnabled = false, escConfigured = false, escArmed = false, escArming = false, autoEnabled = false;
 bool escSignalEnabled = false;
-StartupPreposition startupPreposition;
 ThrustTorqueControl thrustTorque;
 bool torquePrepared=false,torqueActive=false;
-bool prepositionOwnedServos=false,prepositionResumeAuto=false;
-uint32_t prepositionAt=0;
 bool actuatorPwmFault = false;
 bool autoMotorAllowed = false; // 每次会话都需明确勾选授权，此标志本身不会启动电调。
 bool tiltThrottleEnabled=false;
@@ -134,6 +133,7 @@ void applyServoCalibration(const ServoCalibration &calibration) {
   for(int axis=0;axis<2;++axis)if(calibration.travel[axis].zero)servoCenterUs[axis]=calibration.travel[axis].zero;
   GimbalConfig config=automaticPid.config();
   config.azimuthZero=GIMBAL_AZIMUTH_ZERO_DEG;
+  config.travel=servoCalibration.commandTravel(servoCenterUs);
   automaticPid=GimbalPid(config);
   servoActual[0]=servoTarget[0]=GimbalPid::angleToUs(config.azimuthZero,0);
   servoActual[1]=servoTarget[1]=SERVO_CENTER_US;
@@ -205,17 +205,10 @@ void stopEscOutput() {
   if(torquePrepared){
     autoEnabled=false;servoEnabled=false;
     disablePulse(0);disablePulse(1);
-    prepositionOwnedServos=prepositionResumeAuto=false;
   }
   torquePrepared=torqueActive=false;
   thrustTorque.reset();
   tiltThrottleEnabled=false;tiltThrottle.reset();
-  if(startupPreposition.active()){
-    startupPreposition.cancel();
-    if(prepositionOwnedServos){autoEnabled=false;servoEnabled=false;disablePulse(0);disablePulse(1);}
-    else if(servoEnabled && prepositionResumeAuto){automaticPid.reset();autoEnabled=true;}
-  }
-  prepositionOwnedServos=prepositionResumeAuto=false;
   escArmed = escArming = false;
   if (escConfigured && escSignalEnabled) { escActual = escTarget = escStop; pulse(2, escStop); }
   else { escActual = escTarget = 0; disablePulse(2); }
@@ -238,8 +231,7 @@ bool recoverableImuFault() {
   return !fault[0] || !strcmp(fault,"CALIBRATION_MOVED") || !strcmp(fault,"CALIBRATION_DATA") || !strcmp(fault,"CALIBRATION_STORAGE") ||
     !strcmp(fault,"HEADING_UNDEFINED") || !strcmp(fault,"IMU_TIMEOUT") ||
     !strcmp(fault,"ATTITUDE_GAP") || !strcmp(fault,"ATTITUDE_INVALID") || !strcmp(fault,"IMU_RESTART") ||
-    !strcmp(fault,"MOUNT_CALIBRATION") || !strcmp(fault,"THROTTLE_INVALID") ||
-    !strcmp(fault,"PREPOSITION_MOVED") || !strcmp(fault,"PREPOSITION_TIMEOUT");
+    !strcmp(fault,"MOUNT_CALIBRATION") || !strcmp(fault,"THROTTLE_INVALID");
 }
 bool motorModeAllowed() {
   return operatingMode==MODE_MANUAL || (operatingMode==MODE_ATTITUDE && autoMotorAllowed && worldReady);
@@ -249,11 +241,11 @@ bool commandNeedsEpoch(const char *command) {
     !strcmp(command,"esc_config") || !strcmp(command,"esc_arm") ||
     !strcmp(command,"servo") || !strcmp(command,"esc") ||
     !strcmp(command,"cg_servo_enable") || !strcmp(command,"cg_servo_jog") ||
-    !strcmp(command,"set_mode") || !strcmp(command,"calibrate") || !strcmp(command,"restore_calibration") ||
+    !strcmp(command,"set_mode") || !strcmp(command,"calibrate") || !strcmp(command,"restore_calibration") || !strcmp(command,"mount_config") ||
     !strcmp(command,"world_zero") || !strcmp(command,"clear_fault") || !strcmp(command,"pid_config") ||
     !strcmp(command,"select_imu") || !strcmp(command,"tilt_throttle_config") || !strcmp(command,"servo_calibrate") ||
     !strcmp(command,"torque_config") || !strcmp(command,"attitude_target") ||
-    !strcmp(command,"servo_travel_start") || !strcmp(command,"servo_travel_step") ||
+    !strcmp(command,"servo_travel_start") || !strcmp(command,"servo_travel_step") || !strcmp(command,"servo_travel_jog") ||
     !strcmp(command,"servo_travel_zero") || !strcmp(command,"servo_travel_capture") || !strcmp(command,"servo_travel_save");
 }
 bool controllerLeaseExpired() {
@@ -295,25 +287,35 @@ bool controlSourcePresent(uint8_t source) {
 const char *gravityReferenceKey(){return controlSource==SOURCE_IMU1?"imu1-v1":"imu2-v1";}
 int controlOutwardAxis(){return controlSource==SOURCE_IMU1?IMU1_OUTWARD_AXIS:IMU2_OUTWARD_AXIS;}
 
-bool applyGravityReference(const GravityReference &reference) {
+bool applyGravityReference(const GravityReference &reference,const float *outward=nullptr) {
   for(float bias:reference.bias)if(!isfinite(bias)||fabsf(bias)>=15)return false;
   float matrix[3][3];
-  if(!buildUprightMount(reference.up,matrix,controlMountYawDeg(controlSource),controlOutwardAxis()))return false;
+  const bool valid=outward?buildMountBasis(reference.up,outward,matrix):
+    buildUprightMount(reference.up,matrix,controlMountYawDeg(controlSource),controlOutwardAxis());
+  if(!valid)return false;
   memcpy(mountingMatrix,matrix,sizeof(mountingMatrix));
   memcpy(imu.bias,reference.bias,sizeof(imu.bias));
+  guidedMount=outward!=nullptr;
   return true;
 }
 
 void loadGravityReference() {
   Preferences storage;
   GravityReference reference{};
-  bool loaded=false;
+  savedGravityReference=false;
   if(storage.begin("tvc-gravity",true)){
-    loaded=storage.getBytesLength(gravityReferenceKey())==sizeof(reference)&&
-           storage.getBytes(gravityReferenceKey(),&reference,sizeof(reference))==sizeof(reference);
+    const char *key=gravityReferenceKey();
+    const size_t size=storage.getBytesLength(key);
+    if(size==sizeof(GuidedGravityReference)){
+      GuidedGravityReference guided{};
+      savedGravityReference=storage.getBytes(key,&guided,sizeof(guided))==sizeof(guided)&&
+        applyGravityReference(guided.gravity,guided.outward);
+    }else if(size==sizeof(reference)){
+      savedGravityReference=storage.getBytes(key,&reference,sizeof(reference))==sizeof(reference)&&
+        applyGravityReference(reference);
+    }
     storage.end();
   }
-  savedGravityReference=loaded&&applyGravityReference(reference);
   if(!savedGravityReference){
     reference={};
     const float *up=controlSource==SOURCE_IMU1?IMU1_DEFAULT_UP_G:IMU2_DEFAULT_UP_G;
@@ -323,12 +325,27 @@ void loadGravityReference() {
   gravityStartupSamples=0;
 }
 
-bool saveGravityReference(const GravityReference &reference) {
+bool saveGravityReference(const GravityReference &reference,const float *outward=nullptr) {
   Preferences storage;
   if(!storage.begin("tvc-gravity",false))return false;
-  const bool saved=storage.putBytes(gravityReferenceKey(),&reference,sizeof(reference))==sizeof(reference);
+  bool saved;
+  if(outward){
+    const GuidedGravityReference guided{reference,{outward[0],outward[1],outward[2]}};
+    saved=storage.putBytes(gravityReferenceKey(),&guided,sizeof(guided))==sizeof(guided);
+  }else saved=storage.putBytes(gravityReferenceKey(),&reference,sizeof(reference))==sizeof(reference);
   storage.end();
   return saved;
+}
+
+void invalidateGravityState() {
+  gravityStartupSamples=0;
+  fault="";
+  worldReady=calibrated=imu.calibrated=mountingCalibrated=gimbalTiltValid=correctionActive=false;
+  imu.calibrationSamples=calibrationRejectedSamples=0;
+  attitude.invalidate();
+  controlAttitude.invalidate();
+  automaticPid.reset();
+  lastControlMeasurementUs=0;
 }
 
 bool restoreGravityReference() {
@@ -339,13 +356,7 @@ bool restoreGravityReference() {
   storage.end();
   if(!removed)return false;
   loadGravityReference();
-  fault="";
-  worldReady=calibrated=imu.calibrated=mountingCalibrated=gimbalTiltValid=correctionActive=false;
-  imu.calibrationSamples=calibrationRejectedSamples=0;
-  attitude.invalidate();
-  controlAttitude.invalidate();
-  automaticPid.reset();
-  lastControlMeasurementUs=0;
+  invalidateGravityState();
   ++epoch;
   return true;
 }
@@ -561,12 +572,12 @@ void safetyTask(void *) {
         proposed.bias[k]=imu.biasSum[k]/imu.calibrationSamples;
       }
       if(!enough)latchFault(calibrationRejectedSamples>60?"CALIBRATION_MOVED":"CALIBRATION_DATA");
-      else if(!applyGravityReference(proposed))latchFault("MOUNT_CALIBRATION");
+      else if(!applyGravityReference(proposed,guidedMount?mountingMatrix[0]:nullptr))latchFault("MOUNT_CALIBRATION");
       else {
         float meanBody[3];toBody(meanA,meanBody);
         if(!attitude.initializeFromAccel(meanBody[0],meanBody[1],meanBody[2]))latchFault("MOUNT_CALIBRATION");
         else {
-          savedGravityReference=saveGravityReference(proposed);
+          savedGravityReference=saveGravityReference(proposed,guidedMount?mountingMatrix[0]:nullptr);
           if(savedGravityReference){
             markGravityReady(nowUs);
             float corrected[3];for(int k=0;k<3;++k)corrected[k]=imu.g[k]-imu.bias[k];
@@ -587,14 +598,16 @@ void safetyTask(void *) {
         const uint64_t ageUs=nowUs>=imu.t?nowUs-imu.t:0;
         const bool newMeasurement=imu.t!=lastControlMeasurementUs;
         gimbalTiltValid=projectHistory(attitude,bodyG,ageUs,HISTORY_PREDICTION_US,controlAttitude) &&
-                        gimbalLean(controlAttitude.rotation(),autoErrorPitch,autoErrorRoll);
+                        gimbalLean(controlAttitude.rotation(),autoErrorPitch,autoErrorRoll) &&
+                         gimbalControlUpright(controlAttitude.rotation());
         if(torqueActive){
           auto geometry=automaticPid.config();
           geometry.limit=ELEVATION_MAX_DEFLECTION_DEG;
+          const TorqueEscStep esc{escStop,escMax,escActual,5};
           if(!imuFresh(nowUs))latchFault("TORQUE_IMU_STALE");
           else if(!gimbalTiltValid || !thrustTorque.update(geometry,nowUs,
-                     controlAttitude.rotation(),bodyG,servoActual,servoTarget))latchFault("TORQUE_CONTROL_INVALID");
-          else escTarget=escStop+int(std::lround((escMax-escStop)*thrustTorque.throttlePct*.01f));
+                     controlAttitude.rotation(),bodyG,servoActual,servoTarget,&esc))latchFault("TORQUE_CONTROL_INVALID");
+          else escTarget=esc.targetUs(thrustTorque.throttlePct);
         } else if (autoEnabled && servoEnabled) {
           if(!gimbalTiltValid)latchFault("ATTITUDE_INVALID");
           else if (automaticPid.update(nowUs,autoErrorPitch,autoErrorRoll,
@@ -603,29 +616,41 @@ void safetyTask(void *) {
         }
         lastControlMeasurementUs=imu.t;
       }
-      // 自动模式启动前保持电调停止脉宽，仅让舵机向当前姿态的比例纠偏目标移动。
-      if(startupPreposition.active()){
-        if(!gimbalTiltValid || startupPreposition.moved(autoErrorPitch,autoErrorRoll,PREPOSITION_MAX_MOTION_DEG))
-          latchFault("PREPOSITION_MOVED");
-        else if(millis()-prepositionAt>=PREPOSITION_TIMEOUT_MS) latchFault("PREPOSITION_TIMEOUT");
-        else {
-          servoTarget[0]=startupPreposition.goal(0);servoTarget[1]=startupPreposition.goal(1);
-          if(startupPreposition.ready(servoActual,millis(),PREPOSITION_SETTLE_MS,imuFresh(nowUs)) && millis()-armAt>=armHold){
-            startupPreposition.cancel();prepositionOwnedServos=prepositionResumeAuto=false;
-            automaticPid.reset();autoEnabled=!torquePrepared;
+      // 解锁只等待电调停止脉宽保持时间。姿态模式仍检查有效且新鲜的控制 IMU。
+      if(escArming && !fault[0]){
+        if(operatingMode==MODE_ATTITUDE && !gimbalTiltValid)latchFault("ATTITUDE_INVALID");
+        else if(millis()-armAt>=armHold){
+          if(operatingMode==MODE_ATTITUDE && !imuFresh(nowUs))latchFault("IMU_TIMEOUT");
+          else{
+            if(operatingMode==MODE_ATTITUDE){
+              if(!servoEnabled)enableServosAtCenter();
+              if(!torquePrepared && !autoEnabled){automaticPid.reset();autoEnabled=true;}
+            }
+            escArming=false;escArmed=true;
           }
         }
       }
-      if(escArming && !startupPreposition.active() && !fault[0] && millis()-armAt>=armHold){escArming=false;escArmed=true;}
       if(tiltThrottleEnabled){
         if(!autoEnabled||!servoEnabled||!escArmed||fault[0]||!gimbalTiltValid)stopEscOutput();
-        else if(!tiltThrottle.update(nowUs,controlAttitude.rotation().m[2][2],imuFresh(nowUs),std::hypot(bodyG[0],bodyG[1])))latchFault("THROTTLE_INVALID");
-        else escTarget=tiltThrottle.pulse(escStop,escMax);
+        else {
+          const auto r=controlAttitude.rotation();
+          if(!tiltThrottle.update(nowUs,r.m[2][2],imuFresh(nowUs),outwardTiltRateDps(r.m[2],bodyG)))
+            latchFault("THROTTLE_INVALID");
+          else escTarget=tiltThrottle.pulse(escStop,escMax);
+        }
       }
       if(servoSweep.axis>=0){
-        servoSweep.tick();
+        servoSweep.tick(millis());
         writePwmUs(servoSweep.axis,servoSweep.current);
-      } else if (servoEnabled) for(int i=0;i<2;++i){servoTarget[i]=limitServoUs(i,servoTarget[i]);servoActual[i]=limitServoUs(i,servoActual[i]+constrain(servoTarget[i]-servoActual[i],-SERVO_SLEW_US_PER_TICK,SERVO_SLEW_US_PER_TICK));pulse(i,servoActual[i]);}
+      } else if (servoEnabled) {
+        const auto &travel=automaticPid.config().travel;
+        for(int i=0;i<2;++i){
+          servoTarget[i]=travel.clamp(i,servoTarget[i]);
+          const int step=constrain(servoTarget[i]-servoActual[i],-SERVO_SLEW_US_PER_TICK,SERVO_SLEW_US_PER_TICK);
+          servoActual[i]=travel.clamp(i,servoActual[i]+step);
+          pulse(i,servoActual[i]);
+        }
+      }
       if (cgServoEnabled && cgServoDirection) {
         if (millis()-cgServoJogAt>=CG_SERVO_JOG_TIMEOUT_MS) cgServoDirection=0;
         else {
@@ -661,6 +686,46 @@ bool integerIn(JsonVariantConst value, int low, int high) {
   return value.is<int>() && value.as<int>()>=low && value.as<int>()<=high;
 }
 
+bool readMountVector(JsonArrayConst values,float result[3]) {
+  if(values.size()!=3)return false;
+  for(int i=0;i<3;++i){
+    if(!values[i].is<float>())return false;
+    result[i]=values[i].as<float>();
+    if(!isfinite(result[i]))return false;
+  }
+  return true;
+}
+
+const char *saveGuidedMount(JsonVariantConst doc) {
+  if(servoEnabled||cgServoEnabled||escArmed||escArming||calibrating)return "STOP_OUTPUTS_FIRST";
+  if(operatingMode!=MODE_ATTITUDE)return "MODE_LOCKED";
+  if(!recoverableImuFault())return "FAULT_REQUIRES_RESTART";
+  if(!imuFresh(esp_timer_get_time()))return "IMU_NOT_READY";
+  if(!integerIn(doc["source_id"],SOURCE_IMU1,SOURCE_IMU2)||doc["source_id"].as<int>()!=controlSource)
+    return "INVALID_IMU_SOURCE";
+  GravityReference proposed{};
+  float leaned[3],outward[3];
+  if(!integerIn(doc["direction"],0,3)||
+     !readMountVector(doc["upright"].as<JsonArrayConst>(),proposed.up)||
+     !readMountVector(doc["leaned"].as<JsonArrayConst>(),leaned)||
+     !readMountVector(doc["bias"].as<JsonArrayConst>(),proposed.bias)||
+     !guidedMountOutward(proposed.up,leaned,doc["direction"].as<int>(),outward))return "MOUNT_POSE_RANGE";
+  for(float bias:proposed.bias)if(fabsf(bias)>=15)return "MOUNT_POSE_RANGE";
+  // 仅在返回第一次采样的竖直姿态且保持静止时提交。
+  const float norm=std::sqrt(dotMountVector(imu.a,imu.a));
+  if(norm<.85f||norm>1.15f||dotMountVector(proposed.up,imu.a)<
+     .99863f*std::sqrt(dotMountVector(proposed.up,proposed.up))*norm)return "MOUNT_RETURN_UPRIGHT";
+  for(int i=0;i<3;++i)if(fabsf(imu.g[i]-proposed.bias[i])>5)return "MOUNT_RETURN_UPRIGHT";
+  if(!saveGravityReference(proposed,outward))return "CALIBRATION_STORAGE";
+  applyGravityReference(proposed,outward);
+  savedGravityReference=true;
+  invalidateGravityState();
+  autoMotorAllowed=false;
+  ++epoch;
+  ++configRevision;
+  return nullptr;
+}
+
 void handleFrame(char *line, int source) {
   char *separator=strrchr(line,'\t');
   if(!separator || strlen(separator+1)!=8){++badFrames;return;}
@@ -684,7 +749,7 @@ void handleFrame(char *line, int source) {
   } else if(controlOwner!=source || strcmp(sid,sessionId) || !doc["boot"].is<const char*>() || strcmp(doc["boot"].as<const char*>(),bootId)) reason="SESSION_MISMATCH";
   else if(request<=lastCommandSeq) reason="OLD_SEQUENCE";
   else if(strcmp(command,"stop") && strcmp(command,"auto_disable") && strcmp(command,"auto_motor_disable") && strcmp(command,"tilt_throttle_disable") &&
-    strcmp(command,"esc_stop") && strcmp(command,"servo_disable") &&
+    strcmp(command,"esc_stop") && strcmp(command,"servo_disable") && strcmp(command,"servo_travel_hold") &&
     strcmp(command,"cg_servo_hold") && strcmp(command,"cg_servo_disable") && (!doc["device_t_us"].is<uint64_t>() ||
     doc["device_t_us"].as<uint64_t>()>uint64_t(esp_timer_get_time())+100000 ||
     uint64_t(esp_timer_get_time())>doc["device_t_us"].as<uint64_t>()+COMMAND_MAX_AGE_US))reason="STALE_COMMAND";
@@ -710,12 +775,20 @@ void handleFrame(char *line, int source) {
         servoEnabled=true;
         ok=true;reason="SERVO_TRAVEL_STARTED";
       }
+    } else if(!strcmp(command,"servo_travel_hold")){
+      servoSweep.hold();ok=true;reason="SERVO_TRAVEL_HOLD";
+    } else if(!strcmp(command,"servo_travel_jog")){
+      const auto direction=doc["direction"];
+      if(servoSweep.axis<0||!ready||!freshHeartbeat())reason="NOT_READY";
+      else if(!integerIn(doc["axis"],0,1)||doc["axis"].as<int>()!=servoSweep.axis||
+              !direction.is<int>()||(direction.as<int>()!=1&&direction.as<int>()!=-1))reason="SERVO_CALIBRATION_RANGE";
+      else{servoSweep.jog(direction.as<int>(),millis());ok=true;reason="SERVO_TRAVEL_JOG";}
     } else if(!strcmp(command,"servo_travel_step") || !strcmp(command,"servo_travel_zero") ||
               !strcmp(command,"servo_travel_capture") || !strcmp(command,"servo_travel_save")){
       if(servoSweep.axis<0||!ready||!freshHeartbeat())reason="NOT_READY";
-      else if(servoSweep.current!=servoSweep.target)reason="SERVO_TRAVEL_MOVING";
+      else if(servoSweep.jogging||servoSweep.current!=servoSweep.target)reason="SERVO_TRAVEL_MOVING";
       else if(!strcmp(command,"servo_travel_step")){
-        if(!integerIn(doc["delta_us"],-20,20)||!doc["delta_us"].as<int>())reason="SERVO_CALIBRATION_RANGE";
+        if(!integerIn(doc["delta_us"],-ServoTravelSweep::maxStepUs,ServoTravelSweep::maxStepUs)||!doc["delta_us"].as<int>())reason="SERVO_CALIBRATION_RANGE";
         else{servoSweep.nudge(doc["delta_us"].as<int>());++epoch;ok=true;reason="SERVO_TRAVEL_STEP";}
       } else if(!strcmp(command,"servo_travel_zero")){
         servoSweep.captureZero();++epoch;ok=true;reason="SERVO_TRAVEL_ZERO";
@@ -764,6 +837,9 @@ void handleFrame(char *line, int source) {
       else if(uint8_t(doc["source"].as<int>())==controlSource){ok=true;reason="IMU_SOURCE_UNCHANGED";}
       else if(!selectControlImuLocked(uint8_t(doc["source"].as<int>())))reason="IMU_NOT_FOUND";
       else{ok=true;reason="IMU_SOURCE_SELECTED";}
+    } else if(!strcmp(command,"mount_config")) {
+      const char *error=saveGuidedMount(doc.as<JsonVariantConst>());
+      ok=error==nullptr;reason=ok?"MOUNT_REFERENCE_SAVED":error;
     } else if(!strcmp(command,"calibrate")) {
       if(!imu.present)reason="IMU_NOT_READY";
       else if(servoEnabled||cgServoEnabled||escArmed||escArming)reason="STOP_OUTPUTS_FIRST";
@@ -790,6 +866,7 @@ void handleFrame(char *line, int source) {
         proposed.travel[0]=servoCalibration.travel[0];proposed.travel[1]=servoCalibration.travel[1];
         if((proposed.travel[0].zero&&proposed.azimuthTenths!=servoCalibration.azimuthTenths)||
            (proposed.travel[1].zero&&proposed.elevationDeg!=servoCalibration.elevationDeg))reason="SERVO_TRAVEL_ZERO_LOCKED";
+        else if(!proposed.elevationHasBothDirections())reason="ELEVATION_CENTER_AT_LIMIT";
         else if(!saveServoCalibration(proposed))reason="SERVO_CALIBRATION_SAVE";
         else {
           applyServoCalibration(proposed);
@@ -809,6 +886,11 @@ void handleFrame(char *line, int source) {
           next.y={doc["kp_y"].as<float>(),doc["ki_y"].as<float>(),doc["kd_y"].as<float>()};
           next.limit=doc["max_tilt_deg"].as<float>();next.integralLimit=fminf(AUTO_INTEGRAL_LIMIT_DEG,next.limit);
           next.azimuthZero=doc["azimuth_zero_deg"].as<float>();next.signX=doc["sign_x"].as<float>();next.signY=doc["sign_y"].as<float>();
+          const char *trimKeys[]={"trim_x_deg","trim_y_deg"};
+          for(int k=0;k<2;++k)if(doc.containsKey(trimKeys[k])){
+            numbers=numbers && doc[trimKeys[k]].is<float>() && !next.model.enabled;
+            next.trim[k]=doc[trimKeys[k]].as<float>();
+          }
         }
         GimbalPid proposed(next);
         if(!numbers||next.x.kp>10||next.y.kp>10||next.x.ki>2||next.y.ki>2||next.x.kd>2||next.y.kd>2||!proposed.configurationValid())reason="PID_CONFIG";
@@ -843,7 +925,7 @@ void handleFrame(char *line, int source) {
       if(operatingMode!=MODE_ATTITUDE)reason="MODE_LOCKED";
       else if(!ready || !worldReady || !gimbalTiltValid)reason="NOT_READY";
       else if((escArmed||escArming)&&!torquePrepared)reason="STOP_ESC_FIRST";
-      else if(torquePrepared&&!torqueActive)reason="PREPOSITION_ACTIVE";
+      else if(torquePrepared&&!torqueActive)reason="TORQUE_NOT_ACTIVE";
       else if(!doc["x_deg"].is<float>() || !doc["y_deg"].is<float>() ||
               !thrustTorque.setTarget(doc["x_deg"].as<float>(),doc["y_deg"].as<float>()))reason="TARGET_RANGE";
       else{++epoch;ok=true;reason="TARGET_ACCEPTED";}
@@ -857,7 +939,8 @@ void handleFrame(char *line, int source) {
       if(operatingMode!=MODE_MANUAL)reason="MODE_LOCKED";
       else if(!ready || !servoEnabled)reason="NOT_READY";
       else if(!doc["epoch"].is<uint32_t>() || doc["epoch"].as<uint32_t>()!=epoch)reason="OLD_EPOCH";
-      else if(!integerIn(doc["x"],SERVO_MIN_US,SERVO_MAX_US))reason="RANGE";
+      else if(!integerIn(doc["x"],std::min<int>(SERVO_MIN_US,automaticPid.config().travel.low[0]),
+                                  std::max<int>(SERVO_MAX_US,automaticPid.config().travel.high[0])))reason="RANGE";
       else if(!integerIn(doc["y"],ELEVATION_MIN_US,ELEVATION_MAX_US))reason="ELEVATION_LIMIT";
       else{servoTarget[0]=doc["x"];servoTarget[1]=doc["y"];ok=true;reason="SERVO_ACCEPTED";}
     } else if(!strcmp(command,"cg_servo_enable")) {
@@ -890,7 +973,17 @@ void handleFrame(char *line, int source) {
       else if(escArmed||escArming)reason="STOP_ESC_FIRST";
       else if(!doc["confirmed"].as<bool>()||!integerIn(doc["stop_us"],900,2100)||!integerIn(doc["min_us"],900,2100)||!integerIn(doc["max_us"],900,2100)||!integerIn(doc["hold_ms"],1000,15000)||doc["hz"].as<int>()!=50)reason="INVALID_ESC_CONFIG";
       else if(doc["min_us"].as<int>()>=doc["stop_us"].as<int>() || doc["max_us"].as<int>()<=doc["stop_us"].as<int>())reason="STOP_NOT_INSIDE_RANGE";
-      else {++epoch;stopEscOutput();disablePulse(2);escSignalEnabled=false;escActual=escTarget=0;escStop=doc["stop_us"];escMin=doc["min_us"];escMax=doc["max_us"];armHold=doc["hold_ms"];escConfigured=true;++configRevision;ok=true;reason="ESC_CONFIGURED";}
+      else {
+        const int requestedStop=doc["stop_us"].as<int>();
+        ++epoch;stopEscOutput();
+        // 已输出的停止中位相同则保持 PWM，避免每次重新配置都让电调丢失信号。
+        // 更改停止中位后，只有显式解锁才开始输出新的中位。
+        if(escSignalEnabled && requestedStop!=escStop){
+          disablePulse(2);escSignalEnabled=false;escActual=escTarget=0;
+        }
+        escStop=requestedStop;escMin=doc["min_us"];escMax=doc["max_us"];armHold=doc["hold_ms"];
+        escConfigured=true;++configRevision;ok=true;reason="ESC_CONFIGURED";
+      }
     } else if(!strcmp(command,"esc_arm")) {
       const bool useTorque=doc["thrust_torque"].as<bool>();
       if(!motorModeAllowed())reason="MODE_LOCKED";
@@ -903,23 +996,11 @@ void handleFrame(char *line, int source) {
       else if(operatingMode==MODE_ATTITUDE && (!worldReady||!mountingCalibrated||!gimbalTiltValid||!imuFresh(esp_timer_get_time())))reason="WORLD_NOT_READY";
       else {
         ++epoch;stopEscOutput();
-        if(operatingMode==MODE_ATTITUDE){
-          prepositionOwnedServos=!servoEnabled;prepositionResumeAuto=autoEnabled;
-          if(!servoEnabled)enableServosAtCenter();
+        if(useTorque){
           autoEnabled=false;automaticPid.reset();
-          int goal[2];
-          auto geometry=automaticPid.config();
-          geometry.limit=ELEVATION_MAX_DEFLECTION_DEG;
-          const bool positioned=useTorque ?
-            thrustTorque.prepare(geometry,autoErrorPitch,autoErrorRoll,servoActual,goal) &&
-              startupPreposition.beginAt(autoErrorPitch,autoErrorRoll,goal) :
-            startupPreposition.begin(automaticPid.config(),autoErrorPitch,autoErrorRoll,servoActual);
-          if(!positioned){stopOutputs();reason=useTorque?"TORQUE_CONFIG":"PID_INVALID";}
-          else{prepositionAt=millis();torquePrepared=useTorque;}
+          torquePrepared=true;
         }
-        if(operatingMode==MODE_MANUAL || startupPreposition.active()){
-          escSignalEnabled=true;escActual=escTarget=escStop;pulse(2,escStop);escArming=true;armAt=millis();ok=true;reason="ARMING";
-        }
+        escSignalEnabled=true;escActual=escTarget=escStop;pulse(2,escStop);escArming=true;armAt=millis();ok=true;reason="ARMING";
       }
     } else if(!strcmp(command,"esc")) {
       if(!motorModeAllowed())reason="MODE_LOCKED";
@@ -954,7 +1035,7 @@ void handleFrame(char *line, int source) {
     } else if(!strcmp(command,"auto_enable")) {
       const bool useTorque=doc["thrust_torque"].as<bool>();
       if(operatingMode!=MODE_ATTITUDE)reason="MODE_LOCKED";
-      else if(startupPreposition.active())reason="PREPOSITION_ACTIVE";
+      else if(escArming)reason="ESC_ARMING";
       else if(doc.containsKey("thrust_torque")&&!doc["thrust_torque"].is<bool>())reason="TORQUE_CONFIG";
       else if(useTorque!=torquePrepared)reason="TORQUE_NOT_READY";
       else if(useTorque&&(!escArmed||!servoEnabled||!imuFresh(esp_timer_get_time())||
@@ -1059,7 +1140,7 @@ void telemetry() {
   outputs["esc_signal_enabled"]=escSignalEnabled;
   outputs["esc_stop_us"]=escStop;outputs["esc_min_us"]=escMin;outputs["esc_max_us"]=escMax;
   auto control=doc.createNestedObject("control");control["auto_enabled"]=autoEnabled;control["auto_motor_allowed"]=autoMotorAllowed;
-  control["preposition_active"]=startupPreposition.active();control["preposition_wait_ms"]=PREPOSITION_SETTLE_MS;
+  control["preposition_active"]=false; // 协议 10 的旧客户端仍依赖此字段。
   control["source_id"]=controlSource;
   control["source_address"]=controlSourceAddress(controlSource);
   control["source_label"]=controlSourceLabel(controlSource);
@@ -1069,6 +1150,7 @@ void telemetry() {
   auto torque=control["thrust_torque"].to<JsonObject>();
   torque["active"]=torqueActive;torque["prepared"]=torquePrepared;
   torque["limited"]=thrustTorque.limited;
+  torque["travel_limited"]=thrustTorque.travelLimited;
   torque["azimuth_rewind"]=thrustTorque.rewinding();
   torque["throttle_target_pct"]=thrustTorque.throttlePct;
   auto target=torque["target_deg"].to<JsonArray>();
@@ -1081,12 +1163,20 @@ void telemetry() {
   }
   control["mount_ready"]=mountingCalibrated;control["tilt_valid"]=gimbalTiltValid;
   control["gravity_reference"]=savedGravityReference?"MANUAL":"DEFAULT";
+  control["mount_method"]="GUIDED_TILT";
+  control["mount_reference_ready"]=guidedMount;
   control["mount_yaw_deg"]=controlMountYawDeg(controlSource);
   auto ranges=outputs.createNestedArray("servo_range_deg");ranges.add(360);ranges.add(270);
-  auto elevationLimits=outputs.createNestedArray("elevation_limits_deg");elevationLimits.add(ELEVATION_MIN_DEG);elevationLimits.add(ELEVATION_MAX_DEG);
+  const auto &commandTravel=automaticPid.config().travel;
+  auto azimuthLimits=outputs.createNestedArray("azimuth_limits_deg");
+  azimuthLimits.add(GimbalPid::usToAngle(commandTravel.low[0],0));
+  azimuthLimits.add(GimbalPid::usToAngle(commandTravel.high[0],0));
+  auto elevationLimits=outputs.createNestedArray("elevation_limits_deg");
+  elevationLimits.add(commandTravel.calibrated?GimbalPid::usToAngle(commandTravel.low[1],1):ELEVATION_MIN_DEG);
+  elevationLimits.add(commandTravel.calibrated?GimbalPid::usToAngle(commandTravel.high[1],1):ELEVATION_MAX_DEG);
   auto throttle=control.createNestedObject("tilt_throttle");
   throttle["enabled"]=tiltThrottleEnabled;throttle["tilt_deg"]=tiltThrottle.tilt;throttle["target_pct"]=tiltThrottle.requested;throttle["output_pct"]=tiltThrottle.percent;
-  throttle["rate_dps"]=tiltThrottle.rate;throttle["rate_gain_pct_dps"]=tiltThrottle.config.rateGain;
+  throttle["rate_dps"]=tiltThrottle.rate;throttle["rate_mode"]="OUTWARD";throttle["rate_gain_pct_dps"]=tiltThrottle.config.rateGain;
   throttle["base_pct"]=tiltThrottle.config.base;throttle["gain_pct_deg"]=tiltThrottle.config.gain;throttle["max_pct"]=tiltThrottle.config.maximum;throttle["deadband_deg"]=tiltThrottle.config.deadband;throttle["ramp_pct_s"]=tiltThrottle.config.ramp;
   auto angles=outputs.createNestedArray("servo_deg");for(int k=0;k<2;++k)angles.add(GimbalPid::usToAngle(servoActual[k],k));
   const auto &cfg=automaticPid.config();
@@ -1098,6 +1188,7 @@ void telemetry() {
   auto travel=control.createNestedObject("servo_travel");
   travel["axis"]=servoSweep.axis;
   travel["capture_endpoints"]=true;travel["explicit_endpoints"]=servoSweep.explicitEndpoints;
+  travel["jogging"]=servoSweep.jogging;
   travel["current_us"]=servoSweep.current;travel["target_us"]=servoSweep.target;
   travel["min_us"]=servoSweep.range.min;travel["zero_us"]=servoSweep.range.zero;travel["max_us"]=servoSweep.range.max;
   auto savedTravel=travel.createNestedArray("saved_us");
@@ -1116,6 +1207,7 @@ void telemetry() {
   auto mount=control.createNestedArray("mount_matrix");for(int r=0;r<3;++r)for(int c=0;c<3;++c)mount.add(mountingMatrix[r][c]);
   auto pid=control.createNestedObject("pid");pid["dt_s"]=automaticPid.dt();
   pid["output_limit_deg"]=cfg.limit;pid["limited"]=automaticPid.limited();
+  pid["trim_x_deg"]=cfg.trim[0];pid["trim_y_deg"]=cfg.trim[1];
   appendPidTelemetry(pid.createNestedObject("x"),automaticPid.x());
   appendPidTelemetry(pid.createNestedObject("y"),automaticPid.y());
   // control_imu 明确承载当前 PID 源；imus 保留原 IMU1 采集通道，imu2 为本地原始数据。

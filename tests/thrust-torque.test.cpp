@@ -1,5 +1,4 @@
 #include "../ThrustTorqueControl.h"
-#include "../StartupPreposition.h"
 #include "../ServoCalibration.h"
 #include <cassert>
 #include <cstdio>
@@ -31,7 +30,7 @@ static void checkRewind(const GimbalConfig &g,float startDeg,float nextDeg) {
       break;
     }
     sawRewind=true;
-    assert(controller.throttlePct>=c.basePct && controller.throttlePct<=c.maximumPct);
+    assert(controller.throttlePct>=0 && controller.throttlePct<=c.basePct);
     const float alignment=controller.requestedNm[0]*controller.allocatedNm[0]+
                           controller.requestedNm[1]*controller.allocatedNm[1];
     assert(alignment>=-1e-5f);
@@ -61,13 +60,9 @@ int main() {
   AttitudeMatrix upright{};
   for(int k=0;k<3;++k)upright.m[k][k]=1;
   int sent[2]={1500,1500},goal[2];
-  StartupPreposition startup;
-  assert(control.prepare(g,0,0,sent,goal));
-  assert(startup.beginAt(0,0,goal));
-  assert(goal[0]==1500 && goal[1]==1500);
   float stopped[3]={},moving[3]={4,3,0};
   assert(control.update(g,10000,upright,stopped,sent,goal));
-  assert(control.throttlePct==c.basePct && goal[1]==1500);
+  assert(control.terms[0].p==2 && control.throttlePct==c.maximumPct && goal[1]>sent[1]);
   assert(control.update(g,20000,upright,stopped,sent,goal));
   assert(control.terms[0].p>0 && control.terms[0].d==0 && goal[1]>sent[1]);
   assert(control.update(g,30000,upright,moving,sent,goal));
@@ -102,6 +97,28 @@ int main() {
   assert(servo.outputUs(1,500,elevationCenter)==elevationCenter+185);
   assert(servo.outputUs(1,2500,elevationCenter)==elevationCenter-185);
   assert(servo.outputUs(1,2500,ELEVATION_PHYSICAL_MIN_US)==ELEVATION_PHYSICAL_MIN_US);
+  // 电调尚未升速时，分配量反映 1505 µs，而不是尚未发出的目标值。
+  auto request=c;
+  request.fullTorqueNm=2;request.basePct=50;request.maximumPct=75;request.trimNm[0]=.4f;
+  assert(control.configure(request) && control.setTarget(0,0));
+  const int center[2]={1500,1500};
+  const TorqueEscStep stoppedEsc{1500,1700,1500,5};
+  assert(control.update(g,4000000,upright,stopped,center,goal,&stoppedEsc));
+  assert(stoppedEsc.nextUs(control.throttlePct)==1505 && control.limited);
+  assert(control.allocatedNm[0]>0 && control.allocatedNm[0]<.0001f);
+
+  request.trimNm[0]=-.2f;
+  assert(control.configure(request));
+  const int positiveElevation[2]={1500,ELEVATION_MAX_US};
+  const TorqueEscStep runningEsc{1500,1700,1600,5};
+  assert(control.update(g,4010000,upright,stopped,positiveElevation,goal,&runningEsc));
+  assert(control.throttlePct==0 && goal[1]<positiveElevation[1]);
+  assert(runningEsc.nextUs(control.throttlePct)==1595 && control.limited);
+
+  AttitudeMatrix inverted=upright;
+  inverted.m[0][0]=inverted.m[2][2]=-1;
+  assert(!control.update(g,4020000,inverted,stopped,center,goal));
+  std::puts("PASS next issued ESC estimate, reverse demand ramp-down and inverted rejection");
   std::puts("PASS ±25 degree elevation, both unwind directions, projected correction, home dwell, and resume");
   std::puts("PASS target ramp, gyro damping, thrust allocation, slew, saturation, and integral guard");
 }

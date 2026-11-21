@@ -1,6 +1,7 @@
 #pragma once
 #include "GimbalControl.h"
 #define TVC_AZIMUTH_REWIND_API 1
+#define TVC_TORQUE_ESC_STEP_API 1
 
 struct ThrustTorqueConfig {
   // 100% 正向油门的推力（N）乘有效轴向力臂（m）。油门模型为 F ∝ u²。
@@ -20,6 +21,23 @@ struct ThrustTorqueConfig {
           !(std::fabs(gravityNmPerDeg[k][1])<=fullTorqueNm)) return false;
     }
     return true;
+  }
+};
+
+// 使用后级实际会送出的下一拍 ESC 指令计算可分配力矩。仿真可不传硬件脉宽约束。
+struct TorqueEscStep {
+  int stop,max,sent,step;
+
+  int targetUs(float percent) const {
+    return stop+int(std::lround((max-stop)*percent*.01f));
+  }
+
+  int nextUs(float target) const {
+    return sent+std::max(-step,std::min(step,targetUs(target)-sent));
+  }
+
+  float nextPercent(float target) const {
+    return max>stop?100.0f*std::max(0,std::min(max-stop,nextUs(target)-stop))/(max-stop):0;
   }
 };
 
@@ -44,27 +62,17 @@ class ThrustTorqueControl {
   void reset() {
     previousUs_=0;
     rewindActive_=false;waitSeconds_=0;
-    limited=false;
+    limited=false;travelLimited=false;
     throttlePct=0;
     for(int k=0;k<2;++k) { terms[k]={};rate_[k]=0;requestedNm[k]=0;allocatedNm[k]=0; }
   }
 
-  // 预定位使用同一推力分配，取静态 P 项和重力补偿，电调由状态机保持停转。
-  bool prepare(const GimbalConfig &g,float x,float y,const int sent[2],int goal[2]) const {
-    if (!config_.valid() || !std::isfinite(x) || !std::isfinite(y)) return false;
-    ThrustTorqueControl preview=*this;
-    preview.reset();
-    preview.reference_[0]=x;preview.reference_[1]=y;
-    preview.calculate(g,x,y,0,0,0,sent,goal,true);
-    return true;
-  }
-
   bool update(const GimbalConfig &g,uint64_t now,const AttitudeMatrix &r,const float gyro[3],
-              const int sent[2],int goal[2]) {
+              const int sent[2],int goal[2],const TorqueEscStep *esc=nullptr) {
     if (!config_.valid() || !now || (previousUs_ && (now<=previousUs_ || now-previousUs_>g.maxGapUs)))
       return false;
     float x,y;
-    if (!gimbalLean(r,x,y)) return false;
+    if (!gimbalControlUpright(r) || !gimbalLean(r,x,y)) return false;
     // 竖直单位向量在机体系中的导数为 -ω×u；据此求两路倾角的真实角速度。
     const auto &u=r.m[2];
     const float dz=gyro[1]*u[0]-gyro[0]*u[1];
@@ -76,8 +84,8 @@ class ThrustTorqueControl {
     if (!std::isfinite(vx) || !std::isfinite(vy)) return false;
     const float dt=previousUs_ ? float(now-previousUs_)*1e-6f : 0;
     previousUs_=now;
-    // 启动及改目标时限制参考角移动速度，扰动反馈仍按每拍实测姿态计算。
-    if (dt==0) { reference_[0]=x;reference_[1]=y; }
+    // 启动立即对已确认目标纠偏；运行中改目标再按参考角速度限幅。
+    if (dt==0) { reference_[0]=target_[0];reference_[1]=target_[1]; }
     const float move[2]={target_[0]-reference_[0],target_[1]-reference_[1]};
     const float distance=std::hypot(move[0],move[1]);
     if (distance>0 && !rewinding()) {
@@ -86,13 +94,13 @@ class ThrustTorqueControl {
     }
     const float alpha=dt>0 ? dt/(dt+g.derivativeSeconds) : 1;
     rate_[0]+=alpha*(vx-rate_[0]);rate_[1]+=alpha*(vy-rate_[1]);
-    calculate(g,x,y,rate_[0],rate_[1],dt,sent,goal,false);
+    calculate(g,x,y,rate_[0],rate_[1],dt,sent,goal,esc);
     return true;
   }
 
   PidTerms terms[2]{};
   float throttlePct=0, requestedNm[2]{}, allocatedNm[2]{};
-  bool limited=false;
+  bool limited=false,travelLimited=false;
   bool rewinding() const { return rewindActive_; }
 
  private:
@@ -109,10 +117,12 @@ class ThrustTorqueControl {
   float estimatedAzimuthUs_=0,waitSeconds_=0;
 
   void calculate(const GimbalConfig &g,float x,float y,float vx,float vy,float dt,
-                 const int sent[2],int goal[2],bool preparing) {
+                 const int sent[2],int goal[2],const TorqueEscStep *esc) {
     const float limit=std::min(g.limit,ELEVATION_MAX_DEG-ELEVATION_CENTER_DEG)*RAD;
     const float maxFraction=config_.maximumPct*.01f;
-    const float capacity=config_.fullTorqueNm*maxFraction*maxFraction*std::sin(limit);
+    const float capacity=config_.fullTorqueNm*maxFraction*maxFraction*
+      (g.travel.calibrated?std::max(-travelSine(g,limit,false),travelSine(g,limit,true)):std::sin(limit));
+    travelLimited=false;
     const float lean[2]={x,y}, speed[2]={vx,vy};
     float baseNm[2], candidateI[2], increment[2];
     for(int k=0;k<2;++k) {
@@ -127,41 +137,62 @@ class ThrustTorqueControl {
                 config_.gravityNmPerDeg[k][1]*y;
     }
     const float desiredX=baseNm[0]+terms[0].i,desiredY=baseNm[1]+terms[1].i;
-    if (!preparing && (rewinding() || crossesAzimuthStop(g,sent[0],desiredX,desiredY) ||
-        crossesAzimuthStop(g,sent[0],baseNm[0]+candidateI[0],baseNm[1]+candidateI[1]))) {
+    if (rewinding() || crossesAzimuthStop(g,limit,sent[0],desiredX,desiredY) ||
+        crossesAzimuthStop(g,limit,sent[0],baseNm[0]+candidateI[0],baseNm[1]+candidateI[1])) {
       requestedNm[0]=desiredX;requestedNm[1]=desiredY;
       for(int k=0;k<2;++k)
         terms[k].output=terms[k].p+terms[k].i+terms[k].d;
       const float azimuth=rewindToHome(g,dt,sent,goal);
       // 返回途中沿可用方位投影，保留能实现的纠偏。冻结积分，直到正常跟踪恢复。
-      allocateElevation(g,desiredX,desiredY,limit,azimuth,sent,goal,false);
+      allocateElevation(g,desiredX,desiredY,limit,azimuth,sent,goal,config_.basePct,esc);
       limited=true;
       return;
     }
-    allocate(g,baseNm[0]+candidateI[0],baseNm[1]+candidateI[1],limit,sent,goal,preparing);
+    allocate(g,baseNm[0]+candidateI[0],baseNm[1]+candidateI[1],limit,sent,goal,esc);
     // 只阻止把不可实现力矩继续推大的积分。消除稳态偏置的反向积分仍然生效。
     bool recalculate=false;
     for(int k=0;k<2;++k) {
-      if (limited && increment[k]*(requestedNm[k]-allocatedNm[k])>0) recalculate=true;
+      if (limited && std::fabs(requestedNm[k]-allocatedNm[k])>capacity*.005f &&
+          increment[k]*(requestedNm[k]-allocatedNm[k])>0) recalculate=true;
       else terms[k].i=candidateI[k];
       terms[k].output=terms[k].p+terms[k].i+terms[k].d;
     }
     if (recalculate)
-      allocate(g,baseNm[0]+terms[0].i,baseNm[1]+terms[1].i,limit,sent,goal,preparing);
+      allocate(g,baseNm[0]+terms[0].i,baseNm[1]+terms[1].i,limit,sent,goal,esc);
   }
 
-  bool crossesAzimuthStop(const GimbalConfig &g,int azimuthUs,float x,float y) const {
+  float travelSine(const GimbalConfig &g,float limit,bool positive) const {
+    const int endpoint=positive?g.travel.high[1]:g.travel.low[1];
+    const float elevation=(GimbalPid::usToAngle(endpoint,1)-ELEVATION_CENTER_DEG)*RAD;
+    return std::sin(positive?std::min(limit,elevation):std::max(-limit,elevation));
+  }
+
+  GimbalPid::TravelSolution travelSolution(const GimbalConfig &g,float x,float y,float limit,float current) const {
+    const float maxFraction=config_.maximumPct*.01f;
+    const float axial=config_.fullTorqueNm*maxFraction*maxFraction;
+    return GimbalPid::selectTravel(x*g.signX,y*g.signY,current,g.azimuthZero,
+      GimbalPid::usToAngle(g.travel.low[0],0),GimbalPid::usToAngle(g.travel.high[0],0),
+      axial*travelSine(g,limit,false),axial*travelSine(g,limit,true));
+  }
+
+  bool crossesAzimuthStop(const GimbalConfig &g,float limit,int azimuthUs,float x,float y) const {
     const float base=config_.basePct*.01f;
     if (std::hypot(x,y)<config_.fullTorqueNm*base*base*std::sin(.15f*RAD)) return false;
     const float current=GimbalPid::usToAngle(azimuthUs,0);
     const float direction=std::atan2(y*g.signY,x*g.signX)/RAD+g.azimuthZero;
     // 有符号俯仰使 180° 周期的方向等价；先检查连续跟随是否会越过机械端点。
     const float continuous=current+std::remainder(direction-current,180.f);
-    return continuous<-.01f || continuous>360.01f;
+    if(!g.travel.calibrated)return continuous<-.01f || continuous>360.01f;
+    const float lo=GimbalPid::usToAngle(g.travel.low[0],0),hi=GimbalPid::usToAngle(g.travel.high[0],0);
+    if(continuous>=lo-.01f && continuous<=hi+.01f)return false;
+    const auto alternative=travelSolution(g,x,y,limit,current);
+    // 只有替代解确实在初始位的另一侧才执行回位。不可达方向留在可用边缘。
+    return (current-g.azimuthZero)*(alternative.azimuth-g.azimuthZero)<0 &&
+           std::fabs(alternative.azimuth-current)>5;
   }
 
   float rewindToHome(const GimbalConfig &g,float dt,const int sent[2],int goal[2]) {
-    const int home=GimbalPid::angleToUs(g.azimuthZero,0);
+    const int home=g.travel.clamp(0,GimbalPid::angleToUs(g.azimuthZero,0));
     if (!rewindActive_) {
       rewindActive_=true;estimatedAzimuthUs_=float(sent[0]);waitSeconds_=0;
     }
@@ -176,43 +207,49 @@ class ThrustTorqueControl {
     return (estimatedAzimuthUs_-500)*.18f;
   }
 
-  void allocate(const GimbalConfig &g,float x,float y,float limit,const int sent[2],int goal[2],bool preparing) {
+  void allocate(const GimbalConfig &g,float x,float y,float limit,const int sent[2],int goal[2],
+                const TorqueEscStep *esc) {
     requestedNm[0]=x;requestedNm[1]=y;
-    const float demand=std::hypot(x,y);
-    const float requiredPct=100*std::sqrt(demand/(config_.fullTorqueNm*std::sin(limit)));
-    throttlePct=std::min(config_.maximumPct,std::max(config_.basePct,requiredPct));
-    const float fraction=throttlePct*.01f;
-    const float axial=config_.fullTorqueNm*fraction*fraction;
-    const float angle=std::asin(std::min(std::sin(limit),demand/axial))/RAD;
     const float current=GimbalPid::usToAngle(sent[0],0);
-    float azimuth=current,elevation=ELEVATION_CENTER_DEG;
-    // 原逆运动学用于选择等价方位；转向时沿下一步可达方位投影，连续保留可用纠偏。
-    if (angle>=.15f)
-      GimbalPid::vectorToAngles(x*g.signX*angle/demand,y*g.signY*angle/demand,current,g.azimuthZero,azimuth,elevation);
-    const int azUs=GimbalPid::angleToUs(azimuth,0);
-    goal[0]=preparing?azUs:approach(sent[0],azUs,g.stepUs);
-    const bool elevationSlewing=allocateElevation(
-      g,x,y,limit,GimbalPid::usToAngle(goal[0],0),sent,goal,preparing,axial);
-    limited=requiredPct>config_.maximumPct || goal[0]!=azUs || elevationSlewing;
+    const float base=config_.basePct*.01f;
+    const float deadband=config_.fullTorqueNm*base*base*std::sin(.15f*RAD);
+    const auto solution=std::hypot(x,y)>=deadband?travelSolution(g,x,y,limit,current):
+                                               GimbalPid::TravelSolution{current,0,false};
+    const int azUs=g.travel.clamp(0,GimbalPid::angleToUs(solution.azimuth,0));
+    goal[0]=g.travel.clamp(0,approach(sent[0],azUs,g.stepUs));
+    const bool turning=goal[0]!=azUs;
+    // 换向阶段不因尚不可实现的横向力矩提高转速。
+    const bool elevationLimited=allocateElevation(g,x,y,limit,GimbalPid::usToAngle(goal[0],0),
+        sent,goal,turning?config_.basePct:config_.maximumPct,esc);
+    travelLimited=g.travel.calibrated && solution.limited;
+    limited=solution.limited || turning || elevationLimited;
   }
 
   bool allocateElevation(const GimbalConfig &g,float x,float y,float limit,float azimuth,const int sent[2],
-                         int goal[2],bool preparing,float axial=0) {
+                         int goal[2],float throttleCeiling,const TorqueEscStep *esc) {
     const float heading=(azimuth-g.azimuthZero)*RAD;
     const float basis[2]={std::cos(heading)*g.signX,std::sin(heading)*g.signY};
     const float projection=x*basis[0]+y*basis[1];
-    if (axial==0) {
-      const float requiredPct=100*std::sqrt(std::fabs(projection)/(config_.fullTorqueNm*std::sin(limit)));
-      throttlePct=std::min(config_.maximumPct,std::max(config_.basePct,requiredPct));
-      const float fraction=throttlePct*.01f;
-      axial=config_.fullTorqueNm*fraction*fraction;
-    }
-    const float bounded=std::max(-std::sin(limit),std::min(std::sin(limit),projection/axial));
-    const int elUs=limitServoUs(1,GimbalPid::angleToUs(ELEVATION_CENTER_DEG+std::asin(bounded)/RAD,1));
-    goal[1]=preparing?elUs:approach(sent[1],elUs,g.stepUs);
-    const float usable=axial*std::sin((GimbalPid::usToAngle(goal[1],1)-ELEVATION_CENTER_DEG)*RAD);
+    const float low=travelSine(g,limit,false);
+    const float high=travelSine(g,limit,true);
+    const float capacity=config_.fullTorqueNm*(projection<0?-low:high);
+    const float required=capacity>0?100*std::sqrt(std::fabs(projection)/capacity):
+                                   (projection==0?config_.basePct:config_.maximumPct);
+    throttlePct=std::min(throttleCeiling,std::max(config_.basePct,required));
+    const float fraction=throttlePct*.01f;
+    const float targetAxial=config_.fullTorqueNm*fraction*fraction;
+    const float bounded=targetAxial>0?std::max(low,std::min(high,projection/targetAxial)):0;
+    const int elUs=g.travel.clamp(1,GimbalPid::angleToUs(ELEVATION_CENTER_DEG+std::asin(bounded)/RAD,1));
+    goal[1]=g.travel.clamp(1,approach(sent[1],elUs,g.stepUs));
+    const float elevationSine=std::sin((GimbalPid::usToAngle(goal[1],1)-ELEVATION_CENTER_DEG)*RAD);
+    // 舵机来不及越过中位时先撤油门请求。已送出的 ESC 脉宽仍按限速下降。
+    const bool opposing=projection*elevationSine<0;
+    if (opposing)throttlePct=0;
+    const float issuedFraction=(esc?esc->nextPercent(throttlePct):throttlePct)*.01f;
+    const float usable=config_.fullTorqueNm*issuedFraction*issuedFraction*elevationSine;
     for(int k=0;k<2;++k) allocatedNm[k]=usable*basis[k];
-    return goal[1]!=elUs;
+    return goal[1]!=elUs || required>throttleCeiling || opposing ||
+           (esc && esc->nextUs(throttlePct)!=esc->targetUs(throttlePct));
   }
 
   static int approach(int current,int target,int step) {

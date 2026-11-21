@@ -4,6 +4,31 @@
 #include "ServoLimits.h"
 #include <algorithm>
 
+inline float dotMountVector(const float a[3],const float b[3]) {
+  return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+}
+
+inline void crossMountVector(const float a[3],const float b[3],float result[3]) {
+  result[0]=a[1]*b[2]-a[2]*b[1];
+  result[1]=a[2]*b[0]-a[0]*b[2];
+  result[2]=a[0]*b[1]-a[1]*b[0];
+}
+
+// 矩阵三行是机体 X、Y、Z 在 IMU 原始坐标中的方向。
+inline bool buildMountBasis(const float gravity[3],const float outward[3],float matrix[3][3]) {
+  const float norm=std::sqrt(dotMountVector(gravity,gravity));
+  if(!std::isfinite(norm)||norm<.85f||norm>1.15f)return false;
+  float *x=matrix[0],*z=matrix[2];
+  for(int i=0;i<3;++i)z[i]=gravity[i]/norm;
+  const float projection=dotMountVector(outward,z);
+  for(int i=0;i<3;++i)x[i]=outward[i]-projection*z[i];
+  const float length=std::sqrt(dotMountVector(x,x));
+  if(!std::isfinite(length)||length<.7f)return false;
+  for(int i=0;i<3;++i)x[i]/=length;
+  crossMountVector(z,x,matrix[1]);
+  return true;
+}
+
 // 用竖直时的加速度和已知外向轴构造安装矩阵，默认外向轴是 PCB +Z。
 // 操作者必须把箭体轴竖直向上再校准。本函数利用此已知姿态建立安装矩阵，
 // 不能从任意静止姿态自动识别箭头方向，也不能用重力识别绕箭体长轴的安装角。
@@ -12,18 +37,9 @@
 inline bool buildUprightMount(const float gravity[3], float matrix[3][3], float yawDegrees=0,int outwardAxis=2) {
   if(outwardAxis<0 || outwardAxis>2)return false;
   if (!std::isfinite(yawDegrees) || yawDegrees < -180 || yawDegrees > 180) return false;
-  float length = std::sqrt(gravity[0]*gravity[0]+gravity[1]*gravity[1]+gravity[2]*gravity[2]);
-  if (!std::isfinite(length) || length < .85f || length > 1.15f) return false;
-  float z[3] = {gravity[0]/length,gravity[1]/length,gravity[2]/length};
-  float x[3];
-  for(int i=0;i<3;++i)x[i]=(i==outwardAxis?1.0f:0.0f)-z[outwardAxis]*z[i];
-  length = std::sqrt(x[0]*x[0]+x[1]*x[1]+x[2]*x[2]);
-  // 外向轴与重力过于接近时无法建立横向基准。
-  if (!std::isfinite(length) || length < .7f) return false;
-  for (int i=0;i<3;++i) { matrix[0][i]=x[i]/length;matrix[2][i]=z[i]; }
-  matrix[1][0]=z[1]*matrix[0][2]-z[2]*matrix[0][1];
-  matrix[1][1]=z[2]*matrix[0][0]-z[0]*matrix[0][2];
-  matrix[1][2]=z[0]*matrix[0][1]-z[1]*matrix[0][0];
+  float outward[3]={};
+  outward[outwardAxis]=1;
+  if(!buildMountBasis(gravity,outward,matrix))return false;
   const float radians=yawDegrees*0.0174532925199433f;
   const float cs=std::cos(radians),sn=std::sin(radians);
   for(int column=0;column<3;++column){
@@ -34,16 +50,46 @@ inline bool buildUprightMount(const float gravity[3], float matrix[3][3], float 
   return true;
 }
 
+// direction 顺序为 +X、-X、+Y、-Y，指箭头移动方向。
+// 倾向正轴时，加速度计测得的世界 +Z 向该机体轴的负侧投影。
+inline bool guidedMountOutward(const float upright[3],const float leaned[3],int direction,float outward[3]) {
+  if(direction<0||direction>3)return false;
+  const float upNorm=std::sqrt(dotMountVector(upright,upright));
+  const float leanNorm=std::sqrt(dotMountVector(leaned,leaned));
+  if(!std::isfinite(upNorm)||upNorm<.85f||upNorm>1.15f||
+     !std::isfinite(leanNorm)||leanNorm<.85f||leanNorm>1.15f)return false;
+  const float cosine=dotMountVector(upright,leaned)/(upNorm*leanNorm);
+  constexpr float radians=.0174532925199433f;
+  if(cosine>std::cos(8*radians)||cosine<std::cos(30*radians))return false;
+  const float sign=direction%2 ? 1.0f : -1.0f;
+  float axis[3];
+  for(int k=0;k<3;++k)axis[k]=sign*(leaned[k]/leanNorm-cosine*upright[k]/upNorm);
+  const float norm=std::sqrt(dotMountVector(axis,axis));
+  for(float &component:axis)component/=norm;
+  if(direction<2)for(int k=0;k<3;++k)outward[k]=axis[k];
+  else {
+    const float z[3]={upright[0]/upNorm,upright[1]/upNorm,upright[2]/upNorm};
+    crossMountVector(axis,z,outward);
+  }
+  return true;
+}
+
 // 用“世界竖直方向在机体中的分量”计算两向倾斜，竖直姿态没有欧拉航向奇异点。
 // 绕箭体自身 Z 轴的自旋不属于这两路云台能独立控制的自由度。
 inline bool gimbalLean(const AttitudeMatrix &r, float &x, float &y) {
   if (!std::isfinite(r.m[2][0]) || !std::isfinite(r.m[2][1]) ||
       !std::isfinite(r.m[2][2])) return false;
-  // 不再按箭体倾角大小停机；仅拒绝不能用于计算的非有限姿态数据。
+  // 遥测也使用此角度表达；闭环在 gimbalControlUpright 另行校验适用范围。
   constexpr float degrees=57.29577951308232f;
   x=std::atan2(-r.m[2][0],r.m[2][2])*degrees;
   y=std::atan2(-r.m[2][1],r.m[2][2])*degrees;
   return true;
+}
+
+// 该倾角坐标仅在重力方向处于机体上半球且远离奇异点时用于闭环。
+#define TVC_GIMBAL_UPRIGHT_API 1
+inline bool gimbalControlUpright(const AttitudeMatrix &r) {
+  return std::isfinite(r.m[2][2]) && r.m[2][2]>.001f;
 }
 
 // 可选的已标定小角度动力学：q¨ = A q + B (v - bias)。
@@ -69,6 +115,8 @@ struct GimbalConfig {
   int stepUs;
   uint32_t maxGapUs;
   GimbalModel model{};
+  GimbalTravel travel{};
+  float trim[2]={0,0}; // 非模型角度 PID 的实测配平偏转向量，单位度。
 };
 
 // 方位位置舵机 0..360°；俯仰位置舵机 0..270°、135°为无偏转。
@@ -82,11 +130,15 @@ class GimbalPid {
   bool configurationValid() const {
     return config_.model.valid() && x_.configurationValid() && y_.configurationValid() &&
       config_.limit>=1 && config_.limit<=50 && std::isfinite(config_.azimuthZero) &&
+      std::hypot(config_.trim[0],config_.trim[1])<=std::min(config_.limit,ELEVATION_MAX_DEFLECTION_DEG) &&
       config_.azimuthZero>=0 && config_.azimuthZero<=360 &&
       (config_.signX==1 || config_.signX==-1) && (config_.signY==1 || config_.signY==-1) &&
       config_.stepUs>0 && config_.maxGapUs>=100 && config_.maxGapUs<=50000;
   }
-  void reset() { x_.reset();y_.reset();sampleUs_=0;dt_=0;limited_=false;trackingDirection_=false; }
+  void reset() {
+    x_.reset();y_.reset();sampleUs_=0;dt_=0;limited_=false;
+    residual_[0]=residual_[1]=0;
+  }
   const AnglePid &x() const { return x_; }
   const AnglePid &y() const { return y_; }
   float dt() const { return dt_; }
@@ -116,14 +168,15 @@ class GimbalPid {
       const float ay=uy-m.gravity[2]*leanX-m.gravity[3]*leanY;
       vx=m.bias[0]+m.inverse[0]*ax+m.inverse[1]*ay;
       vy=m.bias[1]+m.inverse[2]*ax+m.inverse[3]*ay;
-    } else { vx=c.signX*ux;vy=c.signY*uy; }
+    } else { vx=c.signX*ux+c.trim[0];vy=c.signY*uy+c.trim[1]; }
   }
   static void initialVector(const GimbalConfig &c,float x,float y,float &vx,float &vy) {
     const float limit=controlLimit(c);
     correctionVector(c,x,y,std::max(-limit,std::min(limit,-c.x.kp*x)),
                      std::max(-limit,std::min(limit,-c.y.kp*y)),vx,vy);
     const float magnitude=std::hypot(vx,vy);
-    if(magnitude>c.limit){vx*=c.limit/magnitude;vy*=c.limit/magnitude;}
+    const float limitDeg=std::min(c.limit,ELEVATION_MAX_DEFLECTION_DEG);
+    if(magnitude>limitDeg){vx*=limitDeg/magnitude;vy*=limitDeg/magnitude;}
   }
   // 低偏转时保持方位；同一向量存在“方位+180°、俯仰取反”的等价解，
   // 按有限行程的实际指令距离选解，避免在 0/360°处跳到另一端。
@@ -144,10 +197,57 @@ class GimbalPid {
       }
     }
   }
+  struct TravelSolution { float azimuth,radial;bool limited; };
+
+  // 两条等效射线分别取行程内最近方向，并沿该方向投影到允许的幅度。
+  // 量纲由调用方决定：角度 PID 使用偏转角，推力模式使用横向力矩。
+  static TravelSolution selectTravel(float x,float y,float current,float zero,
+                                     float azMin,float azMax,float negative,float positive) {
+    constexpr float rad=.0174532925199433f;
+    const float demandSq=x*x+y*y;
+    if(demandSq==0)return {std::max(azMin,std::min(azMax,current)),0,false};
+    const float direction=std::atan2(y,x)/rad+zero;
+    const float tolerance=std::max(1e-12f,1e-6f*demandSq);
+    float bestError=2*demandSq,bestDistance=10000;
+    TravelSolution best{current,0,true};
+    for(int flip=0;flip<2;++flip) {
+      for(int turn=-2;turn<=2;++turn) {
+        const float az=std::max(azMin,std::min(azMax,direction+180*flip+360*turn));
+        const float heading=(az-zero)*rad;
+        const float bx=std::cos(heading),by=std::sin(heading);
+        const float radial=std::max(negative,std::min(positive,x*bx+y*by));
+        const float dx=x-radial*bx,dy=y-radial*by;
+        const float error=dx*dx+dy*dy,distance=std::fabs(az-current);
+        if(error<bestError-tolerance || (std::fabs(error-bestError)<=tolerance && distance<bestDistance)) {
+          best={az,radial,error>tolerance};
+          bestError=error;bestDistance=distance;
+        }
+      }
+    }
+    return best;
+  }
+
+  static bool correctionAngles(const GimbalConfig &c,float x,float y,float current,
+                               float &azimuth,float &elevation) {
+    if(!c.travel.calibrated) {
+      vectorToAngles(x,y,current,c.azimuthZero,azimuth,elevation);
+      return false;
+    }
+    if(std::hypot(x,y)<.15f)x=y=0;
+    const auto solution=selectTravel(x,y,current,c.azimuthZero,
+      usToAngle(c.travel.low[0],0),usToAngle(c.travel.high[0],0),
+      std::max(-c.limit,usToAngle(c.travel.low[1],1)-ELEVATION_CENTER_DEG),
+      std::min(c.limit,usToAngle(c.travel.high[1],1)-ELEVATION_CENTER_DEG));
+    azimuth=solution.azimuth;elevation=ELEVATION_CENTER_DEG+solution.radial;
+    return solution.limited;
+  }
+
   Result update(uint64_t sampleUs,float leanX,float leanY,
                 const int actualUs[2],int targetUs[2],bool allowIntegral=true) {
     if(!configurationValid() || !sampleUs || !std::isfinite(leanX) || !std::isfinite(leanY)) return INVALID;
-    for(int k=0;k<2;++k) if(actualUs[k]<500 || actualUs[k]>2500) return INVALID;
+    for(int k=0;k<2;++k)
+      if(config_.travel.calibrated?actualUs[k]!=config_.travel.clamp(k,actualUs[k]):
+                                  (actualUs[k]<500 || actualUs[k]>2500))return INVALID;
     if(sampleUs_ && sampleUs<sampleUs_) return INVALID;
     if(sampleUs==sampleUs_) return WAITING;
     if(!sampleUs_) { x_.prime(leanX);y_.prime(leanY);sampleUs_=sampleUs;return WAITING; }
@@ -155,43 +255,59 @@ class GimbalPid {
     if(elapsed<100 || elapsed>config_.maxGapUs) return INVALID;
     dt_=float(elapsed)/1e6f;
     const float control=controlLimit(config_);
-    if(!x_.update(0,leanX,dt_,-control,control,!limited_&&allowIntegral) ||
-       !y_.update(0,leanY,dt_,-control,control,!limited_&&allowIntegral)) return INVALID;
+    const bool canIntegrate=allowIntegral && (!config_.model.enabled || !limited_);
+    if(!x_.update(0,leanX,dt_,-control,control,canIntegrate,residual_[0]) ||
+       !y_.update(0,leanY,dt_,-control,control,canIntegrate,residual_[1])) return INVALID;
     float vx,vy;
     correctionVector(config_,leanX,leanY,x_.terms().output,y_.terms().output,vx,vy);
     if(!std::isfinite(vx)||!std::isfinite(vy))return INVALID;
-    float magnitude=std::hypot(vx,vy);
-    bool saturated=magnitude>config_.limit;
-    if(saturated) { vx*=config_.limit/magnitude;vy*=config_.limit/magnitude; }
+    const float requested[2]={vx,vy};
+    const float magnitude=std::hypot(vx,vy);
+    const float limit=std::min(config_.limit,ELEVATION_MAX_DEFLECTION_DEG);
+    bool saturated=magnitude>limit;
+    if(saturated) { vx*=limit/magnitude;vy*=limit/magnitude; }
     float azimuth,elevation;
     float current=usToAngle(actualUs[0],0);
-    // 小幅噪声不驱动方位大角度换向，倾角恢复后使用不同阈值避免边界抖动。
+    // 小于舵机安定分辨率的二维向量沿当前方位投影，不驱动方位换向。
     const float correctionMagnitude=std::hypot(vx,vy);
-    if(correctionMagnitude<(trackingDirection_?0.5f:1.0f)) {
-      trackingDirection_=false;
-      azimuth=current;elevation=135;
+    constexpr float RAD=.0174532925199433f;
+    const float heading=(current-config_.azimuthZero)*RAD;
+    if(correctionMagnitude<.15f) {
+      azimuth=current;
+      elevation=ELEVATION_CENTER_DEG+vx*std::cos(heading)+vy*std::sin(heading);
     } else {
-      trackingDirection_=true;
-      vectorToAngles(vx,vy,current,config_.azimuthZero,azimuth,elevation);
+      saturated=correctionAngles(config_,vx,vy,current,azimuth,elevation)||saturated;
     }
-    // 方位指令还在大幅转向时，先命令俯仰靠近中位，避免指向错误方向。
-    // 这是指令状态限制，不是舵机位置反馈，实际跟随速度必须实物核对。
-    bool turning=std::fabs(azimuth-current)>5;
-    if(turning) elevation=135;
+    // 转向过程中，只施加期望纠偏在当前已发送方位上的分量。
+    // 方位来自上一拍 PWM 指令，实际舵机的位置和跟随速度需实物核对。
+    const bool turning=std::fabs(azimuth-current)>5;
+    if(turning)elevation=ELEVATION_CENTER_DEG+vx*std::cos(heading)+vy*std::sin(heading);
     int desired[2]={angleToUs(azimuth,0),angleToUs(elevation,1)};
     bool slew=false;
     for(int k=0;k<2;++k) {
-      int difference=desired[k]-actualUs[k];
+      const int bounded=config_.travel.clamp(k,desired[k]);
+      saturated |= bounded!=desired[k];
+      int difference=bounded-actualUs[k];
       slew=slew || std::abs(difference)>config_.stepUs;
       targetUs[k]=actualUs[k]+std::max(-config_.stepUs,std::min(config_.stepUs,difference));
-      targetUs[k]=limitServoUs(k,targetUs[k]);
+      targetUs[k]=config_.travel.clamp(k,targetUs[k]);
     }
     limited_=saturated || turning || slew;
+    residual_[0]=residual_[1]=0;
+    if(limited_ && !config_.model.enabled) {
+      const float sentHeading=(usToAngle(targetUs[0],0)-config_.azimuthZero)*RAD;
+      const float sentElevation=usToAngle(targetUs[1],1)-ELEVATION_CENTER_DEG;
+      const float residualX=requested[0]-sentElevation*std::cos(sentHeading);
+      const float residualY=requested[1]-sentElevation*std::sin(sentHeading);
+      // 忽略不到半个俯仰 PWM 量化步长的残差，分别限制继续推大残差的积分。
+      residual_[0]=std::fabs(residualX)>.0675f?config_.signX*residualX:0;
+      residual_[1]=std::fabs(residualY)>.0675f?config_.signY*residualY:0;
+    }
     sampleUs_=sampleUs;
     return UPDATED;
   }
  private:
-  bool trackingDirection_=false;
+  float residual_[2]={0,0};
   GimbalConfig config_;
   AnglePid x_,y_;
   uint64_t sampleUs_;

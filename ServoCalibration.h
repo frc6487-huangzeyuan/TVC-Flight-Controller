@@ -15,20 +15,34 @@ struct ServoTravelRange {
 };
 
 struct ServoTravelSweep {
+  static constexpr int maxStepUs=50;
+  static constexpr int slewUsPerTick=40; // 标定独立限速，每 10 ms 最多走 40 µs。
+  static constexpr uint32_t jogTimeoutMs=250; // 按住期间须续期，松开或掉线时保持当前脉宽。
   int axis=-1, current=0, target=0;
   ServoTravelRange range{};
-  bool explicitEndpoints=false;
+  bool explicitEndpoints=false, jogging=false;
+  uint32_t jogAt=0;
 
   void begin(int channel,int center,bool captureEndpoints=false) {
-    axis=channel;current=target=center;range={};explicitEndpoints=captureEndpoints;
+    axis=channel;current=target=center;range={};explicitEndpoints=captureEndpoints;jogging=false;
   }
   void nudge(int delta) {
     const int next=current+delta, low=ServoTravelRange::lower(axis), high=ServoTravelRange::upper(axis);
     target=next<low?low:next>high?high:next;
   }
-  void tick() {
+  void jog(int direction,uint32_t now) {
+    target=direction>0?ServoTravelRange::upper(axis):ServoTravelRange::lower(axis);
+    jogAt=now;
+    jogging=true;
+  }
+  void hold() {
+    target=current;
+    jogging=false;
+  }
+  void tick(uint32_t now=0) {
+    if(jogging&&now-jogAt>=jogTimeoutMs)hold();
     const int delta=target-current;
-    current+=delta<-4?-4:delta>4?4:delta;
+    current+=delta<-slewUsPerTick?-slewUsPerTick:delta>slewUsPerTick?slewUsPerTick:delta;
     if(range.zero&&!explicitEndpoints){
       if(current<range.min)range.min=current;
       if(current>range.max)range.max=current;
@@ -69,13 +83,40 @@ struct ServoCalibration {
     return {uint16_t(physicalLow),uint16_t(centerUs),uint16_t(physicalHigh)};
   }
 
-  // 指令中位固定为 1500 μs，两侧分别映射到物理行程端点。
+  int direction(int channel) const {
+    return (channel==0?azimuthReversed:elevationReversed)?-1:1;
+  }
+
+  bool elevationHasBothDirections() const {
+    if(travel[1].valid(1))return true;
+    // 140°、210° 对应绝对物理端点，不能作为新的双向机械中位。
+    return elevationDeg>140 && elevationDeg<210;
+  }
+
+  GimbalTravel commandTravel(const int centerUs[2]) const {
+    GimbalTravel result;
+    for(int axis=0;axis<2;++axis) {
+      if(axis==0 && !travel[axis].valid(axis))continue;
+      const auto range=outputRange(axis,centerUs[axis]);
+      const int sense=direction(axis);
+      result.low[axis]=1500+sense*((sense>0?range.min:range.max)-centerUs[axis]);
+      result.high[axis]=1500+sense*((sense>0?range.max:range.min)-centerUs[axis]);
+      result.calibrated |= travel[axis].valid(axis) ||
+          result.low[axis]!=servoLowerUs(axis) || result.high[axis]!=servoUpperUs(axis);
+    }
+    return result;
+  }
+
+  // 俯仰和实测轴使用同一脉宽比例；物理端点直接约束控制器有效行程。
   int outputUs(int channel,int commandUs,int centerUs) const {
     const auto range=outputRange(channel,centerUs);
     const int low=servoLowerUs(channel),high=servoUpperUs(channel);
-    const bool reverse=channel==0?azimuthReversed:elevationReversed;
-    int offset=limitServoUs(channel,commandUs)-1500;
-    if(reverse)offset=-offset;
+    const int sense=direction(channel);
+    if(channel==1 || travel[channel].valid(channel)) {
+      const int physical=centerUs+sense*(commandUs-1500);
+      return physical<range.min?range.min:physical>range.max?range.max:physical;
+    }
+    const int offset=sense*(limitServoUs(channel,commandUs)-1500);
     const int inputSpan=offset<0?1500-low:high-1500;
     const int outputSpan=offset<0?centerUs-range.min:range.max-centerUs;
     const int magnitude=((offset<0?-offset:offset)*outputSpan+inputSpan/2)/inputSpan;

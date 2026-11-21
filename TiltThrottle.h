@@ -2,6 +2,12 @@
 #include <cmath>
 #include <cstdint>
 
+// 重力方向 u 的机体 Z 分量导数为 (gyro × u) 的相反数。
+inline float outwardTiltRateDps(const float up[3],const float gyroDps[3]) {
+  const float horizontal=std::hypot(up[0],up[1]);
+  return horizontal>.001f?std::fmax(0.f,(gyroDps[0]*up[1]-gyroDps[1]*up[0])/horizontal):0.f;
+}
+
 // 油门百分比是“停止脉宽→正向最大脉宽”的比例，不是测得的 RPM 或推力。
 struct TiltThrottleConfig {float base=0,gain=1,maximum=30,deadband=2,ramp=10,rateGain=0;};
 class TiltThrottle {
@@ -14,7 +20,7 @@ class TiltThrottle {
       c.base>=0&&c.base<=c.maximum&&c.maximum<=100&&c.maximum>0&&c.gain>=0&&c.gain<=5&&c.deadband>=0&&c.deadband<=30&&c.ramp>=1&&c.ramp<=100&&c.rateGain>=0&&c.rateGain<=5;
   }
   void reset(){requested=percent=tilt=rate=0;previousUs_=0;}
-  // 使用与倾倒有关的横向角速度，绕纵轴的自旋不参与油门计算。
+  // 使用合倾角向外增长的速率；回正、绕纵轴转动均不增加油门。
   bool update(uint64_t now,float bodyZWorldZ,bool fresh,float tiltRateDps=0){
     if(!valid()||!std::isfinite(bodyZWorldZ)||!std::isfinite(tiltRateDps)||tiltRateDps<0||!now)return false;
     const float z=bodyZWorldZ<-1?-1:bodyZWorldZ>1?1:bodyZWorldZ;

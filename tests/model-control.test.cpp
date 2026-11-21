@@ -1,4 +1,4 @@
-#include "../StartupPreposition.h"
+#include "../GimbalControl.h"
 #include <cassert>
 #include <cstdio>
 static bool near(float a,float b){return std::fabs(a-b)<.002f;}
@@ -14,20 +14,12 @@ int main(){
   GimbalPid::correctionVector(c,1,-2,-5,6,vx,vy);
   assert(near(3+2*(vx+2),-5)&&near(-8+4*(vy-1),6));
   GimbalPid::initialVector(c,0,0,vx,vy);assert(near(vx,-2)&&near(vy,1));
-  int sent[2]={1500,1500};StartupPreposition prepare;
-  assert(prepare.begin(c,0,0,sent));
-  float az=GimbalPid::usToAngle(prepare.goal(0),0),el=GimbalPid::usToAngle(prepare.goal(1),1);
-  float a=(az-180)*.0174532925199433f;
+  int sent[2]={1500,1500};
+  float az,el;
+  GimbalPid::correctionAngles(c,vx,vy,180,az,el);
+  const float a=(az-180)*.0174532925199433f;
   assert(std::fabs((el-135)*std::cos(a)+2)<.15f);
   assert(std::fabs((el-135)*std::sin(a)-1)<.15f);
-  // 初始方位在边缘时，模型模式选择中间半圈的等价解。
-  int edge[2]={500,1500};assert(prepare.begin(c,3,4,edge));
-  az=GimbalPid::usToAngle(prepare.goal(0),0);
-  assert(az>=90&&az<=270);
-  float desiredX,desiredY;GimbalPid::initialVector(c,3,4,desiredX,desiredY);
-  el=GimbalPid::usToAngle(prepare.goal(1),1);a=(az-180)*.0174532925199433f;
-  assert(std::fabs((el-135)*std::cos(a)-desiredX)<.15f);
-  assert(std::fabs((el-135)*std::sin(a)-desiredY)<.15f);
   assert(near(GimbalPid::initialAzimuthReference(c,0,-2,1),180));
   assert(near(GimbalPid::initialAzimuthReference(c,0,0,0),0));
   c.model.enabled=false;assert(near(GimbalPid::initialAzimuthReference(c,0,-2,1),0));c.model.enabled=true;
@@ -40,5 +32,5 @@ int main(){
   }
   c.model.inverse[3]=0;assert(!GimbalPid(c).configurationValid());
   c.model.inverse[3]=.25f;c.model.gravity[0]=NAN;assert(!GimbalPid(c).configurationValid());
-  std::puts("PASS model inversion, legacy defaults, startup bias, actuator limits and invalid calibration");
+  std::puts("PASS model inversion, legacy defaults, trim bias, actuator limits and invalid calibration");
 }

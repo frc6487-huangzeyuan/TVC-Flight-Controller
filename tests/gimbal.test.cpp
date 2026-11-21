@@ -16,23 +16,21 @@ int main(){
   // 同一 PCB、同面同向的 IMU 必须把相同传感器向量映射到相同机体分量。
   // 已知传感器重力为 +Y 时，朝外法线为传感器 +Z，水平切向为传感器 +X。
   gravity[0]=0;gravity[1]=1;gravity[2]=0;
-  const float half=std::sqrt(.5f);
-  const float golden[2][3][3]={{{half,0,half},{half,0,-half},{0,1,0}},
-                              {{half,0,half},{half,0,-half},{0,1,0}}};
-  expect(near(controlMountYawDeg(SOURCE_IMU1),-45)&&near(controlMountYawDeg(SOURCE_IMU2),-45),"coplanar aligned IMUs share the existing IMU2 mounting reference");
+  const float golden[3][3]={{0,0,1},{1,0,0},{0,1,0}};
+  const float sensorPlusX[3]={0,0,1};
+  const float sensorPlusY[3]={1,0,0};
+  expect(near(controlMountYawDeg(SOURCE_IMU1),0)&&near(controlMountYawDeg(SOURCE_IMU2),0),"both IMUs use zero mounting yaw");
   for(int source=SOURCE_IMU1;source<=SOURCE_IMU2;++source){
     expect(buildUprightMount(gravity,mount,controlMountYawDeg(source)),"each source uses its own yaw mounting angle");
     for(int row=0;row<3;++row)for(int col=0;col<3;++col)
-      expect(near(mount[row][col],golden[source-1][row][col]),"mounting rotation matches the independent coplanar matrix");
+      expect(near(mount[row][col],golden[row][col]),"mounting matrix preserves the unrotated horizontal axes");
     for(int row=0;row<3;++row)for(int other=0;other<3;++other){
       float dot=0;for(int col=0;col<3;++col)dot+=mount[row][col]*mount[other][col];
       expect(near(dot,row==other?1:0),"mounting remains orthonormal after yaw correction");
     }
-    const float sensorPlusX[2][3]={{half,0,half},{half,0,half}};
-    const float sensorPlusY[2][3]={{half,0,-half},{half,0,-half}};
     for(int row=0;row<3;++row){
       float bx=0,by=0,vertical=0;
-      for(int col=0;col<3;++col){bx+=mount[row][col]*sensorPlusX[source-1][col];by+=mount[row][col]*sensorPlusY[source-1][col];vertical+=mount[row][col]*gravity[col];}
+      for(int col=0;col<3;++col){bx+=mount[row][col]*sensorPlusX[col];by+=mount[row][col]*sensorPlusY[col];vertical+=mount[row][col]*gravity[col];}
       expect(near(bx,row==0?1:0)&&near(by,row==1?1:0),"identical raw X/Y test vectors map identically for both IMUs");
       expect(near(vertical,row==2?1:0),"yaw correction preserves upright gravity and total tilt");
     }
@@ -68,7 +66,16 @@ int main(){
   expect(pid.update(1010000,-20,20,actual,target)==GimbalPid::WAITING&&near(terms.output,pid.x().terms().output),"duplicate samples do not integrate or differentiate");
   expect(pid.update(1100000,0,0,actual,target)==GimbalPid::INVALID,"unknown sampling gaps are rejected");
   pid.reset();expect(pid.update(9000000,0,-10,actual,target)==GimbalPid::WAITING,"reset clears old sample time");
-  expect(pid.update(9010000,0,-10,actual,target)==GimbalPid::UPDATED&&target[1]==1500,"large azimuth turn temporarily keeps elevation centered");
+  expect(pid.update(9010000,0,-10,actual,target)==GimbalPid::UPDATED&&target[0]>1500&&target[1]==1500,
+         "correction perpendicular to the sent azimuth starts at zero elevation");
+  actual[0]=GimbalPid::angleToUs(220,0);
+  actual[1]=GimbalPid::angleToUs(135+10*std::sin(40*.0174532925199433f),1);
+  expect(pid.update(9020000,0,-10,actual,target)==GimbalPid::UPDATED&&target[0]>actual[0]&&target[1]==actual[1]&&pid.limited(),
+         "turning azimuth retains the reachable elevation component and inhibits integration");
+  pid.reset();actual[1]=1500;
+  pid.update(9000000,0,10,actual,target);
+  expect(pid.update(9010000,0,10,actual,target)==GimbalPid::UPDATED&&target[0]>actual[0]&&target[1]<1500,
+         "mirrored vector uses negative elevation while azimuth keeps rotating toward an equivalent solution");
   auto c=config();c.x.ki=.5f;GimbalPid integral(c);actual[0]=actual[1]=1500;
   for(int i=0;i<1000;++i){integral.update(1000000+10000*i,50,50,actual,target);for(int k=0;k<2;++k)actual[k]=target[k];}
   expect(std::fabs(integral.x().terms().i)<.3f&&std::fabs(integral.y().terms().i)<.3f,"vector saturation and slew inhibit integral windup");
@@ -83,5 +90,24 @@ int main(){
   az=GimbalPid::usToAngle(actual[0],0);el=GimbalPid::usToAngle(actual[1],1);
   float direction=(az-c.azimuthZero)*.0174532925199433f;
   expect(near((el-135)*std::cos(direction),-2,.2f)&&near((el-135)*std::sin(direction),3,.2f),"running PWM maps to the same corrected X/Y vector as startup");
+  {
+    auto cfg=config();
+    cfg.limit=50;cfg.stepUs=25;cfg.x={1,.01f,0};
+    GimbalPid limited(cfg);
+    int sent[2]={1500,ELEVATION_MAX_US},goal[2]={sent[0],sent[1]};
+    for(uint64_t t=10000;t<=3000000;t+=10000) {
+      expect(limited.update(t,-26,0,sent,goal)!=GimbalPid::INVALID,"valid position-limited PID sample");
+      sent[0]=goal[0];sent[1]=goal[1];
+    }
+    expect(limited.limited()&&sent[1]==ELEVATION_MAX_US,"physical elevation saturation reported");
+    expect(limited.x().terms().i<.01f,"integration stops into physical saturation");
+
+    cfg=config();cfg.x={.6f,0,0};cfg.trim[0]=2;
+    GimbalPid trim(cfg);
+    int atCenter[2]={1500,1500};
+    trim.update(10000,0,0,atCenter,goal);
+    expect(trim.update(20000,0,0,atCenter,goal)==GimbalPid::UPDATED&&goal[1]>1500,
+           "measured trim works at zero attitude error");
+  }
   std::printf("PASS %d gimbal geometry and PID checks; no physical hardware used.\n",checks);
 }

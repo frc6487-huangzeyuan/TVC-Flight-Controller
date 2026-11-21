@@ -24,10 +24,8 @@ constexpr uint8_t SOURCE_IMU1 = 1;
 constexpr uint8_t SOURCE_IMU2 = 2;
 constexpr uint8_t DEFAULT_CONTROL_SOURCE = SOURCE_IMU2; // 网页默认选择 IMU2，切换后固件实际生效。
 // 同一 PCB、同一面、同向安装：两块 IMU 使用相同的机体安装方位。
-// 保留 IMU2 原先的 -45° 作为共同参考；绝对机械方位仍需小角度倾斜核对。
-// 下面是“PCB 朝外法线相对机体 +X”的方位角，不是给欧拉倾角直接加减的数。
-// 从箭头朝尾部俯视，逆时针为正。竖直静止校准不能辨识绕箭体长轴的安装角。
-constexpr float IMU2_MOUNT_YAW_DEG = -45.0f;
+// 以各传感器的参考轴在水平面的投影作为机体 +X，两路均不叠加方位旋转。
+constexpr float IMU2_MOUNT_YAW_DEG = 0.0f;
 constexpr float IMU1_MOUNT_YAW_DEG = IMU2_MOUNT_YAW_DEG;
 constexpr float controlMountYawDeg(uint8_t source) {
   return source==SOURCE_IMU1 ? IMU1_MOUNT_YAW_DEG : IMU2_MOUNT_YAW_DEG;
@@ -94,16 +92,12 @@ constexpr float AUTO_MODEL_BIAS[2] = {0,0};
 constexpr float AUTO_MODEL_GRAVITY[4] = {0,0,0,0};
 constexpr float AUTO_MODEL_INVERSE[4] = {0,0,0,0};
 constexpr float AUTO_MODEL_ACCEL_LIMIT = 15.0f; // 角加速度上限，度/秒²。
-constexpr int SERVO_SLEW_US_PER_TICK = 25;  // 每 10 ms 最多变化 25us，即 2500us/s；手动、自动和预定位共用。
-// 预定位到达目标 PWM 后额外等待；这是估计时间，不是舵机位置反馈。
-constexpr uint32_t PREPOSITION_SETTLE_MS = 2000;
-constexpr uint32_t PREPOSITION_TIMEOUT_MS = 20000;
-constexpr float PREPOSITION_MAX_MOTION_DEG = 2.0f;
+constexpr int SERVO_SLEW_US_PER_TICK = 25;  // 每 10 ms 最多变化 25us，即 2500us/s；手动与自动共用。
 constexpr uint32_t PWM_HZ = 50;
 constexpr uint8_t PWM_BITS = 14;
 constexpr uint32_t SERIAL_BAUD = 460800;
 constexpr uint8_t PROTOCOL_VERSION = 10;
-constexpr char FW_VERSION[] = "tvc-gimbal-2.5.3";
+constexpr char FW_VERSION[] = "tvc-gimbal-2.5.11";
 constexpr float GIMBAL_AZIMUTH_ZERO_DEG = 180.0f; // 几何方位零位。
 constexpr uint16_t DEFAULT_AZIMUTH_SERVO_CENTER_TENTHS=1868;
 constexpr uint16_t DEFAULT_ELEVATION_SERVO_CENTER_DEG=175;

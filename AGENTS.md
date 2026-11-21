@@ -1,5 +1,7 @@
 # TVC 飞控工程
 
+- 2.5.11 工作台使用协议 10。舵机零位标定要保留双向俯仰行程，旧记录读取其有效范围。控制律相关回归入口为 tests/gimbal.test.cpp、tests/thrust-torque.test.cpp、tests/tilt-throttle.test.cpp 和 tests/model-control.test.cpp。2.5.10 起启动预定位已移除。
+
 - 2.4.6 按用户反馈提高两路舵机指令限速：SERVO_SLEW_US_PER_TICK 从 3 改为 10，每 10ms 变化最多 10μs，手动、自动回正和启动预定位共用。按现有映射，上限为方位 180°/s、俯仰 135°/s；不是实测舵机速度。PREPOSITION_SETTLE_MS 仍为 2000。
 
 - 当前接线以用户 2026-11-08 提供的 Schematic2 原理图为准：同一 ESP32-S3 的 SDA9/SCL10 连接两块 MPU6050；IMU1 AD0=GND、0x68、INT8，IMU2 AD0=3.3V、0x69、INT2。默认 IMU1_LOCAL_I2C=true；下方旧 SuperMini/UART 排查记录属于历史接法。
